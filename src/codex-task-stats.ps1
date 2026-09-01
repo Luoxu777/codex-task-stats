@@ -1041,7 +1041,9 @@ function Get-GitCommandParts {
             continue
         }
 
-        $arguments.Add($lower)
+        # Preserve short-option case because Git assigns different meanings to
+        # flags such as add -n (dry-run) and add -N (intent-to-add).
+        $arguments.Add($token)
     }
 
     return [PSCustomObject]@{
@@ -1090,7 +1092,7 @@ function Test-GitShortFlagPresent {
         # overload for a [char] argument. Compare characters explicitly so
         # -n and combined forms such as -nd/-dn/-nfd remain deterministic.
         foreach ($candidateFlag in $argument.Substring(1).ToCharArray()) {
-            if ($candidateFlag -eq $Flag) {
+            if ($candidateFlag -ceq $Flag) {
                 return $true
             }
         }
@@ -1534,6 +1536,10 @@ function ConvertTo-SafeGitCommandAst {
             $redactNext = $true
             continue
         }
+        if ($token -cmatch '^-m.+') {
+            $parts.Add('-m<内容已隐藏>')
+            continue
+        }
 
         if ([string]::IsNullOrWhiteSpace($subcommand) -and -not $token.StartsWith('-', [StringComparison]::Ordinal)) {
             $subcommand = $lower
@@ -1670,7 +1676,7 @@ function ConvertTo-SafeShellCommandAst {
             $redactNext = $true
             continue
         }
-        if ($lower -match '^(?:-p|--password=|--token=|--api-key=|--url=|--uri=).+') {
+        if ($lower -match '^(?:-p|-u|--password=|--token=|--api-key=|--url=|--uri=).+') {
             $optionName = if ($token.Contains('=')) { $token.Substring(0, $token.IndexOf('=') + 1) } else { $token.Substring(0, [Math]::Min(2, $token.Length)) }
             $parts.Add($optionName + '<敏感信息已隐藏>')
             continue
@@ -2036,7 +2042,10 @@ function Invoke-CapturedProcess {
 }
 
 function Get-GitWorkspaceSnapshot {
-    param([string]$Cwd)
+    param(
+        [string]$Cwd,
+        [string[]]$TrackedPathIdsToFind = @()
+    )
 
     $trackingEnabled = [bool](Get-ConfigValue -Config $config -Path @('fileTracking', 'enabled') -Default $true)
     $gitEnabled = [bool](Get-ConfigValue -Config $config -Path @('fileTracking', 'gitStatusSupplement') -Default $true)
@@ -2153,7 +2162,30 @@ function Get-GitWorkspaceSnapshot {
             }
         }
 
-        return [PSCustomObject][ordered]@{
+        $trackedPathIds = [System.Collections.Generic.List[string]]::new()
+        $wantedTrackedPathIds = @{}
+        foreach ($candidatePathId in @($TrackedPathIdsToFind)) {
+            $candidatePathIdText = [string]$candidatePathId
+            if (-not [string]::IsNullOrWhiteSpace($candidatePathIdText)) {
+                $wantedTrackedPathIds[$candidatePathIdText] = $true
+            }
+        }
+        if ($wantedTrackedPathIds.Count -gt 0) {
+            $trackedResult = Invoke-CapturedProcess -FileName ([string]$gitCommand.Source) -Arguments '--no-optional-locks ls-files -z --cached' -WorkingDirectory $repositoryRoot -TimeoutMs $timeoutMs
+            if ($trackedResult.Started -and -not $trackedResult.TimedOut -and $trackedResult.ExitCode -eq 0) {
+                foreach ($trackedPath in ([string]$trackedResult.Stdout).Split([char]0)) {
+                    if ([string]::IsNullOrEmpty($trackedPath)) { continue }
+                    $trackedPathId = Get-FileIdentityHash -PathValue $trackedPath -Cwd $repositoryRoot
+                    if ($wantedTrackedPathIds.ContainsKey($trackedPathId)) {
+                        $trackedPathIds.Add($trackedPathId)
+                        $null = $wantedTrackedPathIds.Remove($trackedPathId)
+                        if ($wantedTrackedPathIds.Count -eq 0) { break }
+                    }
+                }
+            }
+        }
+
+        $snapshot = [ordered]@{
             available = $true
             source = 'git-status-v1'
             reason = ''
@@ -2161,6 +2193,10 @@ function Get-GitWorkspaceSnapshot {
             truncated = $truncated
             entries = @($entries)
         }
+        if (@($TrackedPathIdsToFind).Count -gt 0) {
+            $snapshot['trackedPathIds'] = @($trackedPathIds)
+        }
+        return [PSCustomObject]$snapshot
     }
     catch {
         Write-DebugRecord -Message 'Git 工作区快照采集失败。' -ExceptionObject $_.Exception
@@ -2258,6 +2294,14 @@ function Get-GitSnapshotDeltaOperations {
         }
     }
 
+    $finalTrackedPathIds = @{}
+    foreach ($pathId in @((Get-PropertyValue -Object $Final -Name 'trackedPathIds' -Default @()))) {
+        $pathIdText = [string]$pathId
+        if (-not [string]::IsNullOrWhiteSpace($pathIdText)) {
+            $finalTrackedPathIds[$pathIdText] = $true
+        }
+    }
+
     foreach ($signature in $finalBySignature.Keys) {
         if (-not $baselineBySignature.ContainsKey($signature)) {
             $operation = Convert-WorkspaceEntryToOperation -Entry $finalBySignature[$signature] -WasRemovedFromFinal $false
@@ -2267,7 +2311,14 @@ function Get-GitSnapshotDeltaOperations {
 
     foreach ($signature in $baselineBySignature.Keys) {
         if (-not $finalBySignature.ContainsKey($signature)) {
-            $operation = Convert-WorkspaceEntryToOperation -Entry $baselineBySignature[$signature] -WasRemovedFromFinal $true
+            $baselineEntry = $baselineBySignature[$signature]
+            $baselineKind = [string](Get-PropertyValue -Object $baselineEntry -Name 'kind' -Default '')
+            $baselinePathId = [string](Get-PropertyValue -Object $baselineEntry -Name 'pathId' -Default '')
+            if ([string]::Equals($baselineKind, 'added', [StringComparison]::Ordinal) -and
+                $finalTrackedPathIds.ContainsKey($baselinePathId)) {
+                continue
+            }
+            $operation = Convert-WorkspaceEntryToOperation -Entry $baselineEntry -WasRemovedFromFinal $true
             if ($null -ne $operation) { $operations.Add($operation) }
         }
     }
@@ -4503,7 +4554,17 @@ try {
             $stateForSkillObservation = $null
             try { $stateForSkillObservation = Read-JsonFile -Path $statePath } catch { }
             $mainSkillObservation = Get-MainTranscriptSkillObservation -State $stateForSkillObservation -StopPayload $Payload
-            $endWorkspaceSnapshot = Get-GitWorkspaceSnapshot -Cwd ([string](Get-PropertyValue -Object $Payload -Name 'cwd' -Default ''))
+            $baselineAddedPathIds = [System.Collections.Generic.List[string]]::new()
+            $workspaceBaselineForEnd = Get-PropertyValue -Object $stateForSkillObservation -Name 'workspaceBaseline' -Default $null
+            foreach ($entry in @((Get-PropertyValue -Object $workspaceBaselineForEnd -Name 'entries' -Default @()))) {
+                if ([string]::Equals([string](Get-PropertyValue -Object $entry -Name 'kind' -Default ''), 'added', [StringComparison]::Ordinal)) {
+                    $pathId = [string](Get-PropertyValue -Object $entry -Name 'pathId' -Default '')
+                    if (-not [string]::IsNullOrWhiteSpace($pathId)) { $baselineAddedPathIds.Add($pathId) }
+                }
+            }
+            $endWorkspaceSnapshot = Get-GitWorkspaceSnapshot `
+                -Cwd ([string](Get-PropertyValue -Object $Payload -Name 'cwd' -Default '')) `
+                -TrackedPathIdsToFind @($baselineAddedPathIds)
 
             $summaryObject = Invoke-WithMutex -Name $runMutexName -TimeoutMs 10000 -ScriptBlock {
                 $done = $null

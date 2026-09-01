@@ -23,6 +23,7 @@ $ConfigSource = Join-Path $ProjectRoot 'config\config.example.json'
 $VersionSource = Join-Path $ProjectRoot 'VERSION'
 $OpenAiDocsTranscriptSample = Join-Path $ProjectRoot 'tests\samples\transcript-openai-docs-command-read.jsonl'
 $CustomToolTranscriptSample = Join-Path $ProjectRoot 'tests\samples\transcript-command-read-skill.jsonl'
+$HookJsonSampleRoot = Join-Path $ProjectRoot 'tests\samples'
 $SubagentCorrelationTestScript = Join-Path $ProjectRoot 'tests\subagent-correlation.tests.ps1'
 $TestRoot = Join-Path ([IO.Path]::GetTempPath()) ('codex-task-stats-test-' + [Guid]::NewGuid().ToString('N'))
 $ConfigRoot = Join-Path $TestRoot 'config'
@@ -126,6 +127,32 @@ function Invoke-TestHook {
         throw "$Event 退出码为 $LASTEXITCODE"
     }
     return ($output -join "`n")
+}
+
+function Invoke-TestHookSample {
+    param([string]$Name)
+
+    $samplePath = Join-Path $HookJsonSampleRoot $Name
+    if (-not (Test-Path -LiteralPath $samplePath -PathType Leaf)) {
+        throw "Hook JSON 样本不存在： $samplePath"
+    }
+
+    $sample = [IO.File]::ReadAllText($samplePath, [Text.Encoding]::UTF8) | ConvertFrom-Json -ErrorAction Stop
+    $eventProperty = $sample.PSObject.Properties['hook_event_name']
+    if ($null -eq $eventProperty -or [string]::IsNullOrWhiteSpace([string]$eventProperty.Value)) {
+        throw "Hook JSON 样本缺少 hook_event_name： $samplePath"
+    }
+
+    $fields = @{}
+    foreach ($property in $sample.PSObject.Properties) {
+        if ([string]::Equals($property.Name, 'hook_event_name', [StringComparison]::Ordinal)) { continue }
+        $fields[$property.Name] = $property.Value
+    }
+    $fields['session_id'] = 'thr_sample_replay'
+    $fields['cwd'] = $WorkspaceRoot
+    $fields['transcript_path'] = $null
+
+    return Invoke-TestHook -Event ([string]$eventProperty.Value) -Fields $fields
 }
 
 function Invoke-InstallerExpectingFailure {
@@ -304,6 +331,65 @@ try {
     # The main hook tests do not depend on CODEX_HOME; clear it until the
     # installer integration block deliberately verifies environment selection.
     $env:CODEX_HOME = $null
+
+    # Replay every committed Hook JSON sample through the real handler. Keep
+    # this isolated from the main regression log so sample output cannot alter
+    # the established aggregate assertions below.
+    $sampleReplayRoot = Join-Path $TestRoot 'sample-replay-home'
+    $sampleReplayConfigRoot = Join-Path $sampleReplayRoot 'config'
+    $null = New-Item -ItemType Directory -Path $sampleReplayConfigRoot -Force
+    Copy-Item -LiteralPath $ConfigSource -Destination (Join-Path $sampleReplayConfigRoot 'config.json') -Force
+    Copy-Item -LiteralPath $VersionSource -Destination (Join-Path $sampleReplayRoot 'VERSION') -Force
+    $env:CODEX_TASK_STATS_HOME = $sampleReplayRoot
+    try {
+        $sampleStartRaw = Invoke-TestHookSample -Name 'user-prompt-submit.json'
+        Assert-Contains -Text ([string](($sampleStartRaw | ConvertFrom-Json).systemMessage)) -Expected '开始 '
+        $null = Invoke-TestHookSample -Name 'post-tool-use-apply-patch.json'
+        $null = Invoke-TestHookSample -Name 'post-tool-use-mcp.json'
+        $null = Invoke-TestHookSample -Name 'subagent-start.json'
+        $sampleStopMessage = [string](((Invoke-TestHookSample -Name 'stop.json') | ConvertFrom-Json).systemMessage)
+        Assert-Contains -Text $sampleStopMessage -Expected '🔌 MCP：filesystem/read_file ×1'
+        Assert-Contains -Text $sampleStopMessage -Expected '🤖 子Agent：researcher ×1'
+
+        foreach ($sampleCase in @(
+            [ordered]@{ Name = 'post-tool-use-git.json'; Turn = 'turn_sample_git'; Expected = '🌿 Git：运行 ×1，指令 ×3' },
+            [ordered]@{ Name = 'post-tool-use-shell-safe.json'; Turn = 'turn_sample_shell'; Expected = '⚙️ 其他：Shell命令 ×1' },
+            [ordered]@{ Name = 'post-tool-use-skill-read.json'; Turn = 'turn_sample_skill_read'; Expected = '🧩 Skill：runtime-helper ×1' }
+        )) {
+            $null = Invoke-TestHook -Event 'UserPromptSubmit' -Fields @{
+                session_id = 'thr_sample_replay'
+                turn_id = [string]$sampleCase.Turn
+                transcript_path = $null
+                prompt = 'sample replay'
+            }
+            $null = Invoke-TestHookSample -Name ([string]$sampleCase.Name)
+            $sampleCaseStop = Invoke-TestHook -Event 'Stop' -DurationMilliseconds 500 -Fields @{
+                session_id = 'thr_sample_replay'
+                turn_id = [string]$sampleCase.Turn
+                transcript_path = $null
+                stop_hook_active = $false
+            }
+            Assert-Contains -Text ([string](($sampleCaseStop | ConvertFrom-Json).systemMessage)) -Expected ([string]$sampleCase.Expected)
+        }
+
+        $null = Invoke-TestHook -Event 'UserPromptSubmit' -Fields @{
+            session_id = 'thr_sample_replay'
+            turn_id = 'turn_failed_example'
+            transcript_path = $null
+            prompt = 'sample replay failed status'
+        }
+        $failedSampleMessage = [string](((Invoke-TestHookSample -Name 'stop-failed-extension.json') | ConvertFrom-Json).systemMessage)
+        Assert-Contains -Text $failedSampleMessage -Expected '状态：失败'
+
+        $sampleLog = Get-ChildItem -LiteralPath (Join-Path $sampleReplayRoot 'logs') -Filter '*.log' -File | Select-Object -First 1
+        if ($null -eq $sampleLog) { throw 'Hook JSON 样本回放未生成日志。' }
+        $sampleLogText = [IO.File]::ReadAllText($sampleLog.FullName, [Text.Encoding]::UTF8)
+        Assert-NotContains -Text $sampleLogText -Unexpected 'not persisted by the hook'
+        Assert-NotContains -Text $sampleLogText -Unexpected 'SENSITIVE_PATTERN'
+    }
+    finally {
+        $env:CODEX_TASK_STATS_HOME = $TestRoot
+    }
 
     # Main successful turn: actual transcript injection, structured Skill input,
     # explicit $skill fallback, subagent transcripts, MCP, file operations, and
@@ -826,8 +912,37 @@ git push
             -ExpectedChangeCount ([int]$gitCleanCase.ChangeCount)
     }
 
+    Assert-GitCommandClassification `
+        -TurnId 'turn_git_add_dry_run_short' `
+        -Command 'git add -n README.md' `
+        -ExpectedChangeCount 0
+    Assert-GitCommandClassification `
+        -TurnId 'turn_git_add_intent_to_add' `
+        -Command 'git add -N README.md' `
+        -ExpectedChangeCount 1
+
+    $compactOptionTurn = 'turn_compact_sensitive_options'
+    $null = Invoke-TestHook -Event 'UserPromptSubmit' -Fields @{ turn_id = $compactOptionTurn; prompt = 'compact sensitive option test' }
+    $null = Invoke-TestHook -Event 'PostToolUse' -Fields @{
+        turn_id = $compactOptionTurn
+        tool_name = 'Bash'
+        tool_use_id = 'compact-git-message'
+        tool_input = @{ command = 'git commit -mCOMPACT_COMMIT_SENTINEL' }
+        tool_response = @{}
+    }
+    $null = Invoke-TestHook -Event 'PostToolUse' -Fields @{
+        turn_id = $compactOptionTurn
+        tool_name = 'Bash'
+        tool_use_id = 'compact-shell-credential'
+        tool_input = @{ command = 'curl -udemo_user:p4ssw0rd https://example.invalid' }
+        tool_response = @{}
+    }
+    $null = Invoke-TestHook -Event 'Stop' -DurationMilliseconds 500 -Fields @{ turn_id = $compactOptionTurn; stop_hook_active = $false }
+
     $classificationLogText = [IO.File]::ReadAllText($log.FullName, [Text.Encoding]::UTF8)
-    foreach ($sensitiveValue in @('TOP_SECRET', 'private@example.invalid', 'PRIVATE_COMMIT_MESSAGE')) {
+    Assert-Contains -Text $classificationLogText -Expected 'git commit -m<内容已隐藏>'
+    Assert-Contains -Text $classificationLogText -Expected 'curl -u<敏感信息已隐藏> <远程地址已隐藏>'
+    foreach ($sensitiveValue in @('TOP_SECRET', 'private@example.invalid', 'PRIVATE_COMMIT_MESSAGE', 'COMPACT_COMMIT_SENTINEL', 'demo_user:p4ssw0rd')) {
         Assert-NotContains -Text $classificationLogText -Unexpected $sensitiveValue
     }
 
@@ -945,6 +1060,19 @@ git push
         & $gitExe -C $gitWorkspace add --all
         & $gitExe -C $gitWorkspace commit -q -m 'baseline'
         if ($LASTEXITCODE -ne 0) { throw '无法创建 Git 集成测试基线。' }
+
+        $committedAddedPath = Join-Path $gitWorkspace 'committed-added.txt'
+        [IO.File]::WriteAllText($committedAddedPath, 'committed', $Utf8NoBom)
+        & $gitExe -C $gitWorkspace add -- 'committed-added.txt'
+        if ($LASTEXITCODE -ne 0) { throw '无法暂存提交误报回归测试文件。' }
+        $commitOnlyTurn = 'turn_test_git_commit_staged_addition'
+        $null = Invoke-TestHook -Event 'UserPromptSubmit' -Fields @{ turn_id = $commitOnlyTurn; cwd = $gitWorkspace; prompt = 'GIT_COMMIT_ONLY_SECRET_SHOULD_NOT_BE_STORED' }
+        & $gitExe -C $gitWorkspace commit -q -m 'commit staged addition'
+        if ($LASTEXITCODE -ne 0) { throw '无法提交误报回归测试文件。' }
+        $commitOnlyStopRaw = Invoke-TestHook -Event 'Stop' -DurationMilliseconds 500 -Fields @{ turn_id = $commitOnlyTurn; cwd = $gitWorkspace; stop_hook_active = $false }
+        $commitOnlyMessage = [string](($commitOnlyStopRaw | ConvertFrom-Json).systemMessage)
+        Assert-NotContains -Text $commitOnlyMessage -Unexpected '文件：删除'
+        Assert-NotContains -Text $commitOnlyMessage -Unexpected '📝 文件：'
 
         $gitTurn = 'turn_test_git_delta'
         $null = Invoke-TestHook -Event 'UserPromptSubmit' -Fields @{ turn_id = $gitTurn; cwd = $gitWorkspace; prompt = 'GIT_DELTA_SECRET_SHOULD_NOT_BE_STORED' }

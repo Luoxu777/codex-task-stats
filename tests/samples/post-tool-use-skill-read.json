@@ -1,0 +1,13 @@
+{
+  "session_id": "thr_sample",
+  "turn_id": "turn_sample_skill_read",
+  "hook_event_name": "PostToolUse",
+  "tool_name": "Bash",
+  "tool_use_id": "call_skill_read",
+  "tool_input": {
+    "command": "Get-Content -LiteralPath 'D:\\custom skills\\runtime-helper\\SKILL.md' -Raw"
+  },
+  "tool_response": {
+    "status": "completed"
+  }
+}

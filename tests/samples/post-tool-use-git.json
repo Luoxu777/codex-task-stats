@@ -1,0 +1,1 @@
+{"session_id":"thr_sample","turn_id":"turn_sample_git","transcript_path":null,"cwd":"C:\\work\\example","hook_event_name":"PostToolUse","model":"example-model","permission_mode":"default","tool_name":"Bash","tool_use_id":"call_git_sample","tool_input":{"command":"git status --short --branch; git log --oneline -3; git diff --stat"},"tool_response":{}}

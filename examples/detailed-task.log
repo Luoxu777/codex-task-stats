@@ -1,0 +1,76 @@
+================================================================================
+【任务信息】
+程序版本：vX.X
+记录时间：2026-09-01 14:08:35 +08:00
+session_id：<示例会话ID>
+turn_id：<示例TurnID>
+开始时间：2026-09-01 14:07:08 +08:00
+结束时间：2026-09-01 14:08:34 +08:00
+原始耗时毫秒：86012
+耗时：1分26秒
+
+【执行结果】
+状态：完成
+状态来源：Hook推定
+恢复补记：否
+
+【调用统计】
+MCP：
+  - mysql_7/query ×2
+
+Skill：
+  - analyze ×1
+  - code-review ×2
+
+子Agent：
+  - code_reviewer ×1
+  - architect ×1
+
+Git：
+  运行 ×2
+  指令 ×6
+  变更 ×1
+  命令：
+    运行 1（指令 ×3）：
+      - git status --short
+      - git diff --check
+      - git diff -- src/service/ExampleService.java
+    运行 2（指令 ×3）：
+      - git add -- src/service/ExampleService.java
+      - git diff --cached --check
+      - git status --short
+
+其他：
+  - Shell命令 ×2
+  命令：
+    运行 1：
+      - Get-Content -LiteralPath src/service/ExampleService.java -Raw
+    运行 2：
+      - powershell.exe -NoLogo -NoProfile -File <路径已隐藏>
+命令记录策略：safe（仅保存安全处理后的内容，原始命令不落盘）
+
+【文件变更】
+文件：
+  - 修改 ×3
+文件变更总数：3
+编辑操作次数：4
+未解析编辑操作：0
+文件采集来源：apply_patch + Git状态差异
+文件统计完整性：部分
+
+【Skill采集】
+采集模式：多源识别
+采集来源：主任务会话记录－实际注入 + 子Agent命令记录－读取 SKILL.md
+证据等级：已读取
+解析器版本：3
+会话记录解析：主任务=已读取；子Agent=已读取 2/2
+统计完整性：部分
+
+【统计完整性】
+总体完整性：部分
+限制说明：
+  - Skill 依赖结构化注入、transcript 或 SKILL.md 读取证据，格式变化或缺失可能导致遗漏
+  - 托管工具可能没有完整的标准 Hook 事件
+  - Shell 产生的文件变更可能无法完全归因
+  - 命令日志只保存安全处理后的内容，疑似敏感或无法安全解析的参数会被隐藏
+================================================================================

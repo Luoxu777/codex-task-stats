@@ -1,0 +1,97 @@
+{
+  "schemaVersion": 11,
+  "display": {
+    "multiline": false,
+    "showCoverageNotice": false,
+    "showSuccessStatus": false,
+    "hideEmptyCategories": true,
+    "emptyValue": "无",
+    "highlightStyle": "icon",
+    "icons": {
+      "mcp": "🔌",
+      "skill": "🧩",
+      "subagent": "🤖",
+      "file": "📝",
+      "git": "🌿",
+      "other": "⚙️"
+    },
+    "labels": {
+      "mcp": "MCP",
+      "skill": "Skill",
+      "subagent": "子Agent",
+      "file": "文件",
+      "git": "Git",
+      "other": "其他"
+    }
+  },
+  "skillCollection": {
+    "mode": "multi-source",
+    "explicitMarkers": [
+      "$"
+    ],
+    "deduplicateWithinTurn": true,
+    "maxStructuredNodes": 2000,
+    "transcript": {
+      "enabled": true,
+      "readMain": true,
+      "readSubagents": true,
+      "requireSkillPathInXml": true,
+      "currentTurnLookbackEnabled": true,
+      "lookbackBytes": 1048576,
+      "settleInitialMs": 100,
+      "settleQuietMs": 100,
+      "settleMaxMs": 600,
+      "maxBytes": 4194304,
+      "maxLines": 10000
+    },
+    "commandRead": {
+      "enabled": true,
+      "preferParsedCommand": true,
+      "rawCommandFallback": true,
+      "requireCompletedExecution": true
+    }
+  },
+  "fileTracking": {
+    "enabled": true,
+    "parseApplyPatch": true,
+    "gitStatusSupplement": true,
+    "gitStatusTimeoutMs": 1500,
+    "maxGitStatusEntries": 5000
+  },
+  "collection": {
+    "intermediateMode": "quiet",
+    "settleInitialMs": 350,
+    "settleQuietMs": 350,
+    "settleMaxMs": 2500,
+    "includePermissionRequests": true,
+    "includeCompaction": true
+  },
+  "logging": {
+    "enabled": true,
+    "filePrefix": "codex-task"
+  },
+  "debug": {
+    "enabled": false
+  },
+  "toolAliases": {
+    "Bash": "Shell命令",
+    "update_plan": "计划更新",
+    "view_image": "图片查看"
+  },
+  "agentManagementTools": [
+    "spawn_agent",
+    "send_message",
+    "send_input",
+    "wait",
+    "close_agent",
+    "resume_agent",
+    "followup_task"
+  ],
+  "commandLogging": {
+    "mode": "safe",
+    "includeGit": true,
+    "includeShell": true,
+    "maxCommandChars": 4096,
+    "maxRunsPerTask": 200
+  }
+}

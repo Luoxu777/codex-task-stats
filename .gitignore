@@ -1,0 +1,31 @@
+# Runtime data
+logs/
+data/
+debug/
+backups/
+
+# Installed / user-specific configuration
+config/config.json
+hooks.json
+hook.json
+
+# Temporary files
+*.tmp
+*.log
+
+# Build / release artifacts
+dist/
+*.zip
+*.sha256
+*.patch
+*-build-report.md
+*-verification.json
+*-release-manifest.txt
+SHA256SUMS
+SHA256SUMS.txt
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

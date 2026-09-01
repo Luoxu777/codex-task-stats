@@ -1,0 +1,15 @@
+# Keep Windows PowerShell scripts directly runnable after checkout.
+*.ps1 text eol=crlf
+
+# Keep repository text files consistent across platforms.
+*.md text eol=lf
+*.json text eol=lf
+*.jsonl text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.txt text eol=lf
+VERSION text eol=lf
+LICENSE text eol=lf
+.gitignore text eol=lf
+.gitattributes text eol=lf
+.editorconfig text eol=lf

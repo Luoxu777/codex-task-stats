@@ -1,0 +1,129 @@
+{
+  "description": "Codex Task Stats 配置模板。scripts/install.ps1 会写入 Windows 绝对路径，并将这些处理器安全合并到用户现有 hooks.json。",
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"__INSTALL_DIR__\\bin\\codex-task-stats.ps1\" -Event \"UserPromptSubmit\"",
+            "commandWindows": "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"__INSTALL_DIR__\\bin\\codex-task-stats.ps1\" -Event \"UserPromptSubmit\"",
+            "timeout": 5,
+            "async": false
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"__INSTALL_DIR__\\bin\\codex-task-stats.ps1\" -Event \"PreToolUse\"",
+            "commandWindows": "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"__INSTALL_DIR__\\bin\\codex-task-stats.ps1\" -Event \"PreToolUse\"",
+            "timeout": 5,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"__INSTALL_DIR__\\bin\\codex-task-stats.ps1\" -Event \"PermissionRequest\"",
+            "commandWindows": "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"__INSTALL_DIR__\\bin\\codex-task-stats.ps1\" -Event \"PermissionRequest\"",
+            "timeout": 5,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"__INSTALL_DIR__\\bin\\codex-task-stats.ps1\" -Event \"PostToolUse\"",
+            "commandWindows": "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"__INSTALL_DIR__\\bin\\codex-task-stats.ps1\" -Event \"PostToolUse\"",
+            "timeout": 5,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"__INSTALL_DIR__\\bin\\codex-task-stats.ps1\" -Event \"PreCompact\"",
+            "commandWindows": "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"__INSTALL_DIR__\\bin\\codex-task-stats.ps1\" -Event \"PreCompact\"",
+            "timeout": 5,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "PostCompact": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"__INSTALL_DIR__\\bin\\codex-task-stats.ps1\" -Event \"PostCompact\"",
+            "commandWindows": "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"__INSTALL_DIR__\\bin\\codex-task-stats.ps1\" -Event \"PostCompact\"",
+            "timeout": 5,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"__INSTALL_DIR__\\bin\\codex-task-stats.ps1\" -Event \"SubagentStart\"",
+            "commandWindows": "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"__INSTALL_DIR__\\bin\\codex-task-stats.ps1\" -Event \"SubagentStart\"",
+            "timeout": 5,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"__INSTALL_DIR__\\bin\\codex-task-stats.ps1\" -Event \"SubagentStop\"",
+            "commandWindows": "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"__INSTALL_DIR__\\bin\\codex-task-stats.ps1\" -Event \"SubagentStop\"",
+            "timeout": 5,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"__INSTALL_DIR__\\bin\\codex-task-stats.ps1\" -Event \"Stop\"",
+            "commandWindows": "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"__INSTALL_DIR__\\bin\\codex-task-stats.ps1\" -Event \"Stop\"",
+            "timeout": 15,
+            "async": false
+          }
+        ]
+      }
+    ]
+  }
+}

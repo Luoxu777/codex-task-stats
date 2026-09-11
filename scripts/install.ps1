@@ -797,7 +797,7 @@ if ($existingStopHandlers -gt 0) {
 
 $intermediateAsync = $IntermediateMode -eq 'Quiet'
 $events = @(
-    [PSCustomObject]@{ Name = 'UserPromptSubmit'; Async = $false; Timeout = 5; Matcher = $false },
+    [PSCustomObject]@{ Name = 'UserPromptSubmit'; Async = $false; Timeout = 10; Matcher = $false },
     [PSCustomObject]@{ Name = 'PreToolUse'; Async = $intermediateAsync; Timeout = 5; Matcher = $true },
     [PSCustomObject]@{ Name = 'PermissionRequest'; Async = $intermediateAsync; Timeout = 5; Matcher = $true },
     [PSCustomObject]@{ Name = 'PostToolUse'; Async = $intermediateAsync; Timeout = 5; Matcher = $true },

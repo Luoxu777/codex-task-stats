@@ -51,7 +51,7 @@ $postOne = [ordered]@{
 }
 Add-V21SubagentSpawnMetadataToRecord -Record $postOne -EventName 'PostToolUse' -Payload ([PSCustomObject]@{
     tool_name = 'collaboration_spawn_agent'
-    tool_response = [PSCustomObject]@{ success = $true; task_name = 'Code reviewer' }
+    tool_response = [PSCustomObject]@{ success = $true; agent_id = 'agent-one'; task_name = 'Code reviewer' }
 })
 
 $preTwo = [ordered]@{
@@ -80,7 +80,7 @@ $postTwo = [ordered]@{
 }
 Add-V21SubagentSpawnMetadataToRecord -Record $postTwo -EventName 'PostToolUse' -Payload ([PSCustomObject]@{
     tool_name = 'collaborationspawn_agent'
-    tool_response = [PSCustomObject]@{ success = $true; nickname = 'Architect reviewer' }
+    tool_response = [PSCustomObject]@{ success = $true; agent_id = 'agent-two'; nickname = 'Architect reviewer' }
 })
 
 $events = @(

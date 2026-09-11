@@ -114,7 +114,7 @@ function Add-V17SpawnFallbackSubagentEventsCore {
         $toolUseId = Get-V17ObjectPropertyValue -Object $eventItem -Names @('toolUseId', 'tool_use_id', 'callId', 'call_id')
         if ($null -eq $toolUseId -or [string]::IsNullOrWhiteSpace([string]$toolUseId)) { continue }
 
-        $agentType = Get-V17ObjectPropertyValue -Object $eventItem -Names @('agentType', 'agent_type')
+        $agentType = Get-V17ObjectPropertyValue -Object $eventItem -Names @('spawnDisplayName', 'agentType', 'agent_type')
         $agentTypeText = if ($null -eq $agentType) { 'default' } else { ([string]$agentType).Trim() }
         if ($agentTypeText -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$') { $agentTypeText = 'default' }
         $eventTime = Get-V17JournalEventTimeUtc -Event $eventItem
@@ -123,6 +123,7 @@ function Add-V17SpawnFallbackSubagentEventsCore {
 
         # Include the normalized aliases used by historical journal schemas.
         $syntheticEvents.Add([pscustomobject]@{
+            event           = 'SubagentStart'
             eventName       = 'SubagentStart'
             event_name      = 'SubagentStart'
             hookEventName   = 'SubagentStart'
@@ -234,7 +235,7 @@ function Get-V17JournalEventTimeUtc {
     param([AllowNull()][object]$Event)
 
     $value = Get-V17ObjectPropertyValue -Object $Event -Names @(
-        'timestampUtc', 'timestamp_utc', 'timestamp', 'timeUtc', 'time_utc',
+        'timestampUtc', 'timestamp_utc', 'timestamp', 'at', 'timeUtc', 'time_utc',
         'createdAtUtc', 'created_at_utc', 'createdAt', 'created_at'
     )
     return ConvertTo-V17UtcDateTime -Value $value
@@ -428,7 +429,21 @@ function Get-V17RelatedSubagentJournalData {
             continue
         }
 
-        foreach ($candidateEvent in $candidateEvents) { $mergedEvents.Add($candidateEvent) }
+        $candidateAgentId = ''
+        foreach ($candidateEvent in $candidateEvents) {
+            if ((Get-V17JournalEventName -Event $candidateEvent) -eq 'SubagentStart') {
+                $candidateAgentId = [string](Get-V17ObjectPropertyValue -Object $candidateEvent -Names @('agentId', 'agent_id'))
+                if ($candidateAgentId) { break }
+            }
+        }
+        foreach ($candidateEvent in $candidateEvents) {
+            if ((Get-V17JournalEventName -Event $candidateEvent) -in @('PreToolUse', 'PostToolUse') -and
+                -not (Get-V17ObjectPropertyValue -Object $candidateEvent -Names @('skillScope'))) {
+                $scope = if ($candidateAgentId) { 'agent:' + $candidateAgentId } else { 'turn:' + $candidateTurnId }
+                $candidateEvent | Add-Member -NotePropertyName skillScope -NotePropertyValue $scope -Force
+            }
+            $mergedEvents.Add($candidateEvent)
+        }
         $runHashes.Add($runHash)
         $journalPaths.Add($journalFile.FullName)
         if ($null -eq $candidateStatePaths) {
@@ -815,28 +830,8 @@ function ConvertTo-V21SafeSubagentDisplayName {
         return $null
     }
 
-    # Spawn display fields may be caller-controlled. In safe mode, persist them
-    # only when every token is a generic Agent-role term; project/customer labels
-    # therefore fall back to lifecycle agent_type.
-    if ($Source -in @('task_name', 'nickname', 'display_name')) {
-        $allowedRoleTokens = @(
-            'agent', 'architect', 'architecture', 'audit', 'auditor',
-            'code', 'coder', 'debug', 'debugger', 'design', 'designer',
-            'developer', 'docs', 'documentation', 'engineer', 'implement',
-            'implementer', 'performance', 'plan', 'planner', 'qa',
-            'refactor', 'research', 'researcher', 'review', 'reviewer',
-            'security', 'test', 'tester', 'validate', 'validator',
-            'verify', 'verifier', 'writer'
-        )
-        foreach ($token in @($candidate.ToLowerInvariant() -split '[ _.-]+')) {
-            if ([string]::IsNullOrWhiteSpace($token)) {
-                continue
-            }
-            if ($allowedRoleTokens -notcontains $token) {
-                return $null
-            }
-        }
-    }
+    # Explicit short display fields are names, not a closed vocabulary of roles.
+    # Keep the length, path and credential checks above; never inspect prompts.
 
     return $candidate
 }
@@ -927,7 +922,11 @@ function Get-V21SafeSpawnMetadata {
                 continue
             }
 
-            $safe = ConvertTo-V21SafeSubagentDisplayName -Value $found.Value -Source $search.Source
+            $nameValue = $found.Value
+            if ($search.Source -eq 'task_name' -and $nameValue -is [string] -and $nameValue -match '^/root/(?:[A-Za-z0-9_-]+/)*([A-Za-z0-9_-]+)$') {
+                $nameValue = $Matches[1]
+            }
+            $safe = ConvertTo-V21SafeSubagentDisplayName -Value $nameValue -Source $search.Source
             if (-not [string]::IsNullOrWhiteSpace($safe)) {
                 $displayObservation = $safe
                 $displaySource = [string]$search.Source
@@ -1161,33 +1160,8 @@ function Add-V21SubagentDisplayNames {
         }
     }
 
-    $unmatchedAgentIds = @(
-        foreach ($agentId in $startOrder) {
-            if (-not $nameByAgentId.ContainsKey($agentId)) {
-                $agentId
-            }
-        }
-    )
-
-    $unmatchedSpawns = @(
-        foreach ($spawn in $usableSpawns) {
-            if (-not $usedToolUseIds.ContainsKey([string]$spawn.ToolUseId)) {
-                $spawn
-            }
-        }
-    )
-
-    # V2 collaboration may expose task_name/nickname without an agent_id. In the
-    # aggregate-only client display, an equal one-to-one multiset is sufficient:
-    # identity/count still come exclusively from lifecycle agent_id values.
-    if ($unmatchedAgentIds.Count -gt 0 -and $unmatchedAgentIds.Count -eq $unmatchedSpawns.Count) {
-        for ($index = 0; $index -lt $unmatchedAgentIds.Count; $index++) {
-            $agentId = [string]$unmatchedAgentIds[$index]
-            $spawn = $unmatchedSpawns[$index]
-            $nameByAgentId[$agentId] = [string]$spawn.DisplayName
-            $sourceByAgentId[$agentId] = [string]$spawn.DisplayNameSource
-        }
-    }
+    # Equal counts do not prove identity. Concurrent spawns can complete out of
+    # order; unmatched names must never be assigned by event position.
 
     if ($nameByAgentId.Count -eq 0) {
         return $eventList
@@ -1256,6 +1230,7 @@ function Invoke-V19SubagentCorrelationCompatibilityProbe {
             tool_name = 'collaboration_spawn_agent'
             tool_response = [PSCustomObject]@{
                 success = $true
+                agent_id = 'probe-agent-1'
                 task_name = 'Code reviewer'
             }
         })
@@ -1279,7 +1254,7 @@ function Invoke-V19SubagentCorrelationCompatibilityProbe {
         }
         Add-V21SubagentSpawnMetadataToRecord -Record $postTwo -EventName 'PostToolUse' -Payload ([PSCustomObject]@{
             tool_name = 'collaborationspawn_agent'
-            tool_response = [PSCustomObject]@{ success = $true; nickname = 'Architect reviewer' }
+            tool_response = [PSCustomObject]@{ success = $true; agent_id = 'probe-agent-2'; nickname = 'Architect reviewer' }
         })
 
         $probeEvents = @(

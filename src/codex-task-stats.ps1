@@ -20,6 +20,8 @@ param(
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
+$eventReceivedAt = [DateTimeOffset]::Now
+$eventWatch = [Diagnostics.Stopwatch]::StartNew()
 
 $script:BootstrapPhase = 'initialization'
 
@@ -1349,6 +1351,7 @@ function Get-ShellMoveFileOperations {
         $isMove = @('move-item', 'move', 'mv', 'mi') -contains $commandName
         $isRename = @('rename-item', 'rename', 'ren', 'rni') -contains $commandName
         if (-not $isMove -and -not $isRename) { continue }
+        if (@($commandAst.CommandElements | Where-Object { $_.Extent.Text -match '(?i)^-(?:whatif|wi)(?::\$?true)?$' }).Count -gt 0) { continue }
 
         $sourceRaw = ''
         $targetRaw = ''
@@ -1531,13 +1534,13 @@ function ConvertTo-SafeGitCommandAst {
             $parts.Add($namePart + '<敏感信息已隐藏>')
             continue
         }
-        if (@('-m', '--message', '--author', '--date') -contains $lower) {
+        if (@('-m', '--message', '--author', '--date', '--trailer', '--format', '--pretty', '--grep', '--grep-reflog', '-g', '-s', '--exec') -contains $lower -or $token -cmatch '^-[a-ln-zA-Z]+m$') {
             $parts.Add($token)
             $redactNext = $true
             continue
         }
-        if ($token -cmatch '^-m.+') {
-            $parts.Add('-m<内容已隐藏>')
+        if ($token -cmatch '^-(?<flags>[a-zA-Z]*?m).+') {
+            $parts.Add('-' + $Matches['flags'] + '<内容已隐藏>')
             continue
         }
 
@@ -1573,17 +1576,13 @@ function ConvertTo-SafeGitCommandAst {
         }
         if ($token.StartsWith('--', [StringComparison]::Ordinal) -and $token.Contains('=')) {
             $optionName = $token.Substring(0, $token.IndexOf('=') + 1)
-            $optionValue = $token.Substring($token.IndexOf('=') + 1)
-            if (Test-IsPathLikeCommandToken -Text $optionValue) {
-                $parts.Add($optionName + (ConvertTo-SafeWorkspacePath -Value $optionValue -Cwd $Cwd))
-            }
-            else {
-                $parts.Add($optionName + (ConvertTo-SafeGenericToken -Value $optionValue -Cwd $Cwd))
-            }
+            $parts.Add($optionName + '<内容已隐藏>')
             continue
         }
         if ($token.StartsWith('-', [StringComparison]::Ordinal)) {
-            $parts.Add($token)
+            # Unknown compact short options may contain a message or credential.
+            if ($token -match '^-[^-].{1,}' -and $token -cnotmatch '^-[a-zA-Z]{1,3}$') { $parts.Add('<参数已隐藏>') }
+            else { $parts.Add($token) }
             continue
         }
 
@@ -1629,7 +1628,8 @@ function ConvertTo-SafeShellCommandAst {
         '-password', '--password', '-token', '--token', '-apikey', '--api-key',
         '-uri', '--url', '-filter', '-replace', '-match', '-connectionstring',
         '--connection-string', '-u', '--user', '--username', '-value', '--value',
-        '-inputobject', '-text', '-message', '--message'
+        '-inputobject', '-text', '-message', '--message', '-d', '-h', '-e', '-c',
+        '--data', '--data-raw', '--data-binary', '--data-urlencode', '--json', '--header', '--form', '-f'
     )
     $commandLower = $safeCommandName.ToLowerInvariant()
     $safePlainSubcommands = @{
@@ -1676,6 +1676,10 @@ function ConvertTo-SafeShellCommandAst {
             $redactNext = $true
             continue
         }
+        if ($lower -match '^-(?:d|h|e|c|f).+' -or $lower -match '^-(?:data|header|body|command):') {
+            $parts.Add('<参数已隐藏>')
+            continue
+        }
         if ($lower -match '^(?:-p|-u|--password=|--token=|--api-key=|--url=|--uri=).+') {
             $optionName = if ($token.Contains('=')) { $token.Substring(0, $token.IndexOf('=') + 1) } else { $token.Substring(0, [Math]::Min(2, $token.Length)) }
             $parts.Add($optionName + '<敏感信息已隐藏>')
@@ -1695,7 +1699,11 @@ function ConvertTo-SafeShellCommandAst {
                 $parts.Add($optionName + '<内容已隐藏>')
             }
             else {
-                $parts.Add($token)
+                # Preserve known switches, never arbitrary option-shaped text.
+                if ($token -match '^--[a-zA-Z][a-zA-Z-]*$' -or
+                    $token -match '^-[a-zA-Z]$' -or
+                    $lower -in @('-raw', '-recurse', '-force', '-whatif', '-noprofile', '-noninteractive', '-nologo', '-all', '-short', '-literalpath', '-destination', '-newname')) { $parts.Add($token) }
+                else { $parts.Add('<参数已隐藏>') }
             }
             continue
         }
@@ -1948,525 +1956,176 @@ function Get-ApplyPatchFileOperations {
     return @($operations)
 }
 
-function New-UnavailableWorkspaceSnapshot {
-    param([string]$Reason)
-
-    return [PSCustomObject][ordered]@{
-        available = $false
-        source = 'git-status-v1'
-        reason = $Reason
-        repositoryId = ''
-        truncated = $false
-        entries = @()
+function Undo-FileChangeDiff {
+    param([AllowEmptyString()][string]$Text, [AllowEmptyString()][string]$Diff)
+    if ($Diff -eq '') { return $Text }
+    $hunks = [Collections.Generic.List[object]]::new()
+    $hunk = $null
+    $previous = ''
+    foreach ($line in ($Diff.Replace("`r`n", "`n") -split "`n")) {
+        if ($line -match '^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@') {
+            $hunk = @{start=[int]$Matches[3]; oldCount=1; newCount=1; before=[Collections.Generic.List[string]]::new(); after=[Collections.Generic.List[string]]::new()}
+            if ($Matches[2]) { $hunk.oldCount = [int]$Matches[2] }
+            if ($Matches[4]) { $hunk.newCount = [int]$Matches[4] }
+            $hunks.Add($hunk); $previous = ''; continue
+        }
+        if ($null -eq $hunk) {
+            if ($line -eq '' -or $line.StartsWith('--- ') -or $line.StartsWith('+++ ')) { continue }
+            throw 'unsupported-diff'
+        }
+        if ($line -eq '\ No newline at end of file') {
+            if ($previous -eq '') { throw 'invalid-newline-marker' }
+            foreach ($side in @('before','after')) {
+                if (($side -eq 'before' -and $previous -eq '+') -or ($side -eq 'after' -and $previous -eq '-')) { continue }
+                $last = $hunk[$side].Count - 1
+                $hunk[$side][$last] = $hunk[$side][$last].TrimEnd([char]10)
+            }
+            $previous = ''; continue
+        }
+        if ($line -eq '') { continue }
+        $previous = $line.Substring(0,1)
+        $value = $line.Substring(1) + "`n"
+        switch ($previous) {
+            ' ' { $hunk.before.Add($value); $hunk.after.Add($value) }
+            '-' { $hunk.before.Add($value) }
+            '+' { $hunk.after.Add($value) }
+            default { throw 'unsupported-diff-line' }
+        }
     }
+    if ($hunks.Count -eq 0) { throw 'missing-diff-hunks' }
+    $lines = [Collections.Generic.List[string]]::new()
+    foreach ($match in [regex]::Matches($Text, '[^\n]*\n|[^\n]+$')) { $lines.Add($match.Value) }
+    $nextStart = $lines.Count + 1
+    for ($i=$hunks.Count-1; $i -ge 0; $i--) {
+        $h = $hunks[$i]
+        $start = if ($h.newCount -eq 0) { $h.start } else { $h.start - 1 }
+        if ($h.oldCount -ne $h.before.Count -or $h.newCount -ne $h.after.Count -or $start -lt 0 -or $start+$h.newCount -gt $lines.Count -or $start+$h.newCount -gt $nextStart) { throw 'invalid-diff-range' }
+        for ($j=0; $j -lt $h.newCount; $j++) {
+            if (-not [string]::Equals($lines[$start+$j], $h.after[$j], [StringComparison]::Ordinal)) { throw 'diff-content-mismatch' }
+        }
+        $lines.RemoveRange($start,$h.newCount)
+        $lines.InsertRange($start,$h.before)
+        $nextStart = $start
+    }
+    return ($lines -join '')
 }
 
-function Get-GitStatusKind {
-    param([string]$StatusCode)
-
-    if ([string]::Equals($StatusCode, '??', [StringComparison]::Ordinal)) {
-        return 'added'
-    }
-    if ($StatusCode.IndexOf('A') -ge 0 -or $StatusCode.IndexOf('C') -ge 0) {
-        return 'added'
-    }
-    if ($StatusCode.IndexOf('D') -ge 0) {
-        return 'deleted'
-    }
-    if ($StatusCode.IndexOf('R') -ge 0) {
-        return 'renamed'
-    }
-    if ($StatusCode.IndexOf('M') -ge 0 -or
-        $StatusCode.IndexOf('T') -ge 0 -or
-        $StatusCode.IndexOf('U') -ge 0) {
-        return 'modified'
-    }
-
-    return 'modified'
-}
-
-function Invoke-CapturedProcess {
-    param(
-        [string]$FileName,
-        [string]$Arguments,
-        [string]$WorkingDirectory,
-        [int]$TimeoutMs
-    )
-
-    $process = [Diagnostics.Process]::new()
+function Read-ChangedFileContent {
+    param([string]$Path)
+    $stream = $null; $reader = $null
     try {
-        $startInfo = [Diagnostics.ProcessStartInfo]::new()
-        $startInfo.FileName = $FileName
-        $startInfo.WorkingDirectory = $WorkingDirectory
-        $startInfo.Arguments = $Arguments
-        $startInfo.UseShellExecute = $false
-        $startInfo.CreateNoWindow = $true
-        $startInfo.RedirectStandardOutput = $true
-        $startInfo.RedirectStandardError = $true
-        # Git emits unquoted path bytes when core.quotepath=false. Explicit UTF-8
-        # decoding keeps non-ASCII Windows paths stable when the runtime exposes
-        # these ProcessStartInfo properties (Windows PowerShell 5.1 on modern
-        # .NET Framework does; older runtimes simply skip the optional setting).
-        if ($null -ne $startInfo.PSObject.Properties['StandardOutputEncoding']) {
-            $startInfo.StandardOutputEncoding = [Text.Encoding]::UTF8
-        }
-        if ($null -ne $startInfo.PSObject.Properties['StandardErrorEncoding']) {
-            $startInfo.StandardErrorEncoding = [Text.Encoding]::UTF8
-        }
-        $startInfo.EnvironmentVariables['GIT_OPTIONAL_LOCKS'] = '0'
-        $process.StartInfo = $startInfo
-
-        if (-not $process.Start()) {
-            return [PSCustomObject]@{ Started = $false; TimedOut = $false; ExitCode = -1; Stdout = ''; Stderr = '' }
-        }
-
-        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
-        $stderrTask = $process.StandardError.ReadToEndAsync()
-        if (-not $process.WaitForExit($TimeoutMs)) {
-            try { $process.Kill() } catch { }
-            return [PSCustomObject]@{ Started = $true; TimedOut = $true; ExitCode = -1; Stdout = ''; Stderr = '' }
-        }
-        $process.WaitForExit()
-
-        return [PSCustomObject]@{
-            Started = $true
-            TimedOut = $false
-            ExitCode = $process.ExitCode
-            Stdout = $stdoutTask.Result
-            Stderr = $stderrTask.Result
-        }
+        # ponytail: only touched UTF-8 text files, at most 4 MiB each. Unsupported
+        # content remains unconfirmed rather than falling back to a workspace scan.
+        $stream = [IO.FileStream]::new($Path,[IO.FileMode]::Open,[IO.FileAccess]::Read,([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+        if ($stream.Length -gt 4194304) { throw 'file-too-large' }
+        $length = $stream.Length; $modified = [IO.File]::GetLastWriteTimeUtc($Path)
+        $reader = [IO.StreamReader]::new($stream,[Text.UTF8Encoding]::new($false,$true),$true)
+        $text = $reader.ReadToEnd()
+        if ($text.IndexOf([char]0) -ge 0 -or $stream.Length -ne $length -or [IO.File]::GetLastWriteTimeUtc($Path) -ne $modified) { throw 'unstable-or-binary-file' }
+        return @{exists=$true; text=$text.Replace("`r`n","`n"); known=$true}
     }
-    finally {
-        $process.Dispose()
-    }
+    catch [IO.FileNotFoundException] { return @{exists=$false; text=''; known=$true} }
+    catch [IO.DirectoryNotFoundException] { return @{exists=$false; text=''; known=$true} }
+    catch { return @{exists=$false; text=''; known=$false} }
+    finally { if ($null -ne $reader) { $reader.Dispose() } elseif ($null -ne $stream) { $stream.Dispose() } }
 }
 
-function Get-GitWorkspaceSnapshot {
-    param(
-        [string]$Cwd,
-        [string[]]$TrackedPathIdsToFind = @()
-    )
-
-    $trackingEnabled = [bool](Get-ConfigValue -Config $config -Path @('fileTracking', 'enabled') -Default $true)
-    $gitEnabled = [bool](Get-ConfigValue -Config $config -Path @('fileTracking', 'gitStatusSupplement') -Default $true)
-    if (-not $trackingEnabled -or -not $gitEnabled) {
-        return New-UnavailableWorkspaceSnapshot -Reason 'disabled'
-    }
-    if ([string]::IsNullOrWhiteSpace($Cwd) -or -not (Test-Path -LiteralPath $Cwd -PathType Container)) {
-        return New-UnavailableWorkspaceSnapshot -Reason 'cwd-unavailable'
-    }
-
-    $gitCommand = Get-Command git.exe -ErrorAction SilentlyContinue
-    if ($null -eq $gitCommand) {
-        $gitCommand = Get-Command git -ErrorAction SilentlyContinue
-    }
-    if ($null -eq $gitCommand) {
-        return New-UnavailableWorkspaceSnapshot -Reason 'git-unavailable'
-    }
-
-    $timeoutMs = [int](Get-ConfigValue -Config $config -Path @('fileTracking', 'gitStatusTimeoutMs') -Default 1500)
-    if ($timeoutMs -lt 100) { $timeoutMs = 100 }
-    if ($timeoutMs -gt 4000) { $timeoutMs = 4000 }
-
-    $maxEntries = [int](Get-ConfigValue -Config $config -Path @('fileTracking', 'maxGitStatusEntries') -Default 5000)
-    if ($maxEntries -lt 1) { $maxEntries = 1 }
-    if ($maxEntries -gt 20000) { $maxEntries = 20000 }
-
-    try {
-        $rootTimeoutMs = [Math]::Min(750, $timeoutMs)
-        $rootResult = Invoke-CapturedProcess -FileName ([string]$gitCommand.Source) -Arguments 'rev-parse --show-toplevel' -WorkingDirectory $Cwd -TimeoutMs $rootTimeoutMs
-        if (-not $rootResult.Started) {
-            return New-UnavailableWorkspaceSnapshot -Reason 'git-start-failed'
-        }
-        if ($rootResult.TimedOut) {
-            return New-UnavailableWorkspaceSnapshot -Reason 'git-timeout'
-        }
-        if ($rootResult.ExitCode -ne 0) {
-            return New-UnavailableWorkspaceSnapshot -Reason 'not-a-git-worktree'
-        }
-
-        $repositoryRoot = ([string]$rootResult.Stdout).Trim()
-        if ([string]::IsNullOrWhiteSpace($repositoryRoot) -or -not (Test-Path -LiteralPath $repositoryRoot -PathType Container)) {
-            return New-UnavailableWorkspaceSnapshot -Reason 'git-root-unavailable'
-        }
-
-        $statusResult = Invoke-CapturedProcess -FileName ([string]$gitCommand.Source) -Arguments '-c core.quotepath=false --no-optional-locks status --porcelain=v1 -z --untracked-files=all --ignore-submodules=all --find-renames' -WorkingDirectory $repositoryRoot -TimeoutMs $timeoutMs
-        if (-not $statusResult.Started) {
-            return New-UnavailableWorkspaceSnapshot -Reason 'git-start-failed'
-        }
-        if ($statusResult.TimedOut) {
-            return New-UnavailableWorkspaceSnapshot -Reason 'git-timeout'
-        }
-        if ($statusResult.ExitCode -ne 0) {
-            return New-UnavailableWorkspaceSnapshot -Reason 'git-status-failed'
-        }
-
-        $entries = [System.Collections.Generic.List[object]]::new()
-        $tokens = ([string]$statusResult.Stdout).Split([char]0)
-        $truncated = $false
-        for ($index = 0; $index -lt $tokens.Count; $index++) {
-            $record = [string]$tokens[$index]
-            if ([string]::IsNullOrEmpty($record) -or $record.Length -lt 3) {
-                continue
+function Get-NativeFileChangeSummary {
+    param([object[]]$Changes, [string]$Cwd, [object[]]$RequiredEdits=@())
+    $final = @{}; $current = @{}; $paths = @{}; $records = [Collections.Generic.List[object]]::new()
+    $reasons = [Collections.Generic.List[string]]::new()
+    $nativeEdits = @{}
+    $watch = [Diagnostics.Stopwatch]::StartNew()
+    # No raw paths, source text or diffs escape this in-memory reduction.
+    foreach ($change in @($Changes)) {
+        if ($null -eq $change) { continue }
+        try {
+            $changeCwd = [string](Get-PropertyValue -Object $change -Name 'Cwd' -Default $Cwd)
+            $path = [string]$change.Path
+            if (-not [IO.Path]::IsPathRooted($path)) { $path = Join-Path $changeCwd $path }
+            $path = [IO.Path]::GetFullPath($path)
+            $id = Get-FileIdentityHash -PathValue $path -Cwd $Cwd
+            $paths[$id] = $path
+            $target = $id
+            $move = [string](Get-PropertyValue -Object $change.Detail -Name 'move_path' -Default '')
+            if ($move) {
+                if (-not [IO.Path]::IsPathRooted($move)) { $move = Join-Path $changeCwd $move }
+                $move = [IO.Path]::GetFullPath($move)
+                $target = Get-FileIdentityHash -PathValue $move -Cwd $Cwd
+                $paths[$target] = $move
             }
-
-            $statusCode = $record.Substring(0, 2)
-            $pathText = ''
-            if ($record.Length -gt 3) {
-                $pathText = $record.Substring(3)
+            $records.Add(@{id=$id; target=$target; detail=$change.Detail})
+            $scope=[string](Get-PropertyValue -Object $change -Name 'Scope' -Default 'root')
+            if ($scope -ne 'root') { $scope='agent:'+$scope }
+            foreach ($pathId in @($id,$target)) {
+                $key=$scope+"`n"+$pathId
+                if (-not $nativeEdits.ContainsKey($key)) { $nativeEdits[$key]=@{} }
+                $nativeEdits[$key][[string](Get-PropertyValue -Object $change -Name 'EditId' -Default $records.Count)]=$true
             }
-            $pathId = Get-FileIdentityHash -PathValue $pathText -Cwd $repositoryRoot
-            if ([string]::IsNullOrWhiteSpace($pathId)) {
-                continue
-            }
-
-            if ($statusCode.IndexOf('R') -ge 0) {
-                $sourcePath = ''
-                if (($index + 1) -lt $tokens.Count) {
-                    $sourcePath = [string]$tokens[$index + 1]
-                    $index++
+        }
+        catch { $reasons.Add('文件路径无法解析') }
+    }
+    $textChars = 0
+    foreach ($id in $paths.Keys) {
+        if ($watch.ElapsedMilliseconds -gt 2000 -or $final.Count -ge 1000 -or $textChars -gt 16777216) {
+            $value = @{exists=$false; text=''; known=$false}
+            if (-not $reasons.Contains('涉及文件读取超出预算')) { $reasons.Add('涉及文件读取超出预算') }
+        } else { $value = Read-ChangedFileContent -Path $paths[$id] }
+        $textChars += $value.text.Length
+        $final[$id] = $value
+        $current[$id] = $value.Clone()
+    }
+    foreach ($required in @($RequiredEdits)) {
+        $key=$required.scope+"`n"+$required.pathId
+        if (-not $nativeEdits.ContainsKey($key) -or $nativeEdits[$key].Count -lt $required.count) {
+            if ($current.ContainsKey($required.pathId)) { $current[$required.pathId].known=$false }
+            if (-not $reasons.Contains('存在未匹配原生记录的成功编辑')) { $reasons.Add('存在未匹配原生记录的成功编辑') }
+        }
+    }
+    for ($i=$records.Count-1; $i -ge 0; $i--) {
+        if ($watch.ElapsedMilliseconds -gt 4000) {
+            $reasons.Add('补丁核验超出时间预算')
+            foreach ($key in $current.Keys) { $current[$key].known=$false }
+            break
+        }
+        $record = $records[$i]; $id=$record.id; $target=$record.target; $detail=$record.detail
+        try {
+            if (-not $current[$id].known -or -not $current[$target].known) { throw 'unknown-content' }
+            switch ([string](Get-PropertyValue -Object $detail -Name 'type')) {
+                'add' {
+                    if ($null -eq $detail.PSObject.Properties['content'] -or -not $current[$id].exists -or
+                        -not [string]::Equals($current[$id].text,([string]$detail.content).Replace("`r`n","`n"),[StringComparison]::Ordinal)) { throw 'add-content-mismatch' }
+                    $current[$id] = @{exists=$false; text=''; known=$true}
                 }
-                $sourceId = Get-FileIdentityHash -PathValue $sourcePath -Cwd $repositoryRoot
-                if (-not [string]::IsNullOrWhiteSpace($sourceId)) {
-                    $entries.Add([PSCustomObject][ordered]@{
-                        kind = 'renamed'
-                        sourceId = $sourceId
-                        targetId = $pathId
-                    })
+                'delete' {
+                    if ($null -eq $detail.PSObject.Properties['content'] -or $current[$id].exists) { throw 'delete-content-missing' }
+                    $current[$id] = @{exists=$true; text=([string]$detail.content).Replace("`r`n","`n"); known=$true}
                 }
-                else {
-                    $entries.Add([PSCustomObject][ordered]@{
-                        kind = 'modified'
-                        pathId = $pathId
-                    })
+                'update' {
+                    if ($null -eq $detail.PSObject.Properties['unified_diff'] -or -not $current[$target].exists -or ($target -ne $id -and $current[$id].exists)) { throw 'update-content-missing' }
+                    $before = Undo-FileChangeDiff -Text $current[$target].text -Diff ([string]$detail.unified_diff)
+                    $current[$id] = @{exists=$true; text=$before; known=$true}
+                    if ($target -ne $id) { $current[$target] = @{exists=$false; text=''; known=$true} }
                 }
-            }
-            elseif ($statusCode.IndexOf('C') -ge 0) {
-                # Porcelain -z emits an original path token for copies as well.
-                if (($index + 1) -lt $tokens.Count) { $index++ }
-                $entries.Add([PSCustomObject][ordered]@{
-                    kind = 'added'
-                    pathId = $pathId
-                })
-            }
-            else {
-                $entries.Add([PSCustomObject][ordered]@{
-                    kind = (Get-GitStatusKind -StatusCode $statusCode)
-                    pathId = $pathId
-                })
-            }
-
-            if ($entries.Count -ge $maxEntries) {
-                $truncated = $true
-                break
+                default { throw 'unknown-change-type' }
             }
         }
-
-        $trackedPathIds = [System.Collections.Generic.List[string]]::new()
-        $wantedTrackedPathIds = @{}
-        foreach ($candidatePathId in @($TrackedPathIdsToFind)) {
-            $candidatePathIdText = [string]$candidatePathId
-            if (-not [string]::IsNullOrWhiteSpace($candidatePathIdText)) {
-                $wantedTrackedPathIds[$candidatePathIdText] = $true
-            }
+        catch {
+            $current[$id].known=$false; $current[$target].known=$false
+            if (-not $reasons.Contains('补丁或内容证据缺失、不匹配或文件不可读')) { $reasons.Add('补丁或内容证据缺失、不匹配或文件不可读') }
         }
-        if ($wantedTrackedPathIds.Count -gt 0) {
-            $trackedResult = Invoke-CapturedProcess -FileName ([string]$gitCommand.Source) -Arguments '--no-optional-locks ls-files -z --cached' -WorkingDirectory $repositoryRoot -TimeoutMs $timeoutMs
-            if ($trackedResult.Started -and -not $trackedResult.TimedOut -and $trackedResult.ExitCode -eq 0) {
-                foreach ($trackedPath in ([string]$trackedResult.Stdout).Split([char]0)) {
-                    if ([string]::IsNullOrEmpty($trackedPath)) { continue }
-                    $trackedPathId = Get-FileIdentityHash -PathValue $trackedPath -Cwd $repositoryRoot
-                    if ($wantedTrackedPathIds.ContainsKey($trackedPathId)) {
-                        $trackedPathIds.Add($trackedPathId)
-                        $null = $wantedTrackedPathIds.Remove($trackedPathId)
-                        if ($wantedTrackedPathIds.Count -eq 0) { break }
-                    }
-                }
-            }
-        }
-
-        $snapshot = [ordered]@{
-            available = $true
-            source = 'git-status-v1'
-            reason = ''
-            repositoryId = (Get-FileIdentityHash -PathValue $repositoryRoot -Cwd $repositoryRoot)
-            truncated = $truncated
-            entries = @($entries)
-        }
-        if (@($TrackedPathIdsToFind).Count -gt 0) {
-            $snapshot['trackedPathIds'] = @($trackedPathIds)
-        }
-        return [PSCustomObject]$snapshot
     }
-    catch {
-        Write-DebugRecord -Message 'Git 工作区快照采集失败。' -ExceptionObject $_.Exception
-        return New-UnavailableWorkspaceSnapshot -Reason 'git-error'
+    $added=0; $modified=0; $deleted=0; $unknown=0
+    foreach ($id in $paths.Keys) {
+        $before=$current[$id]; $after=$final[$id]
+        if (-not $before.known -or -not $after.known) { $unknown++; continue }
+        if (-not $before.exists -and $after.exists) { $added++ }
+        elseif ($before.exists -and -not $after.exists) { $deleted++ }
+        elseif ($before.exists -and $after.exists -and -not [string]::Equals($before.text,$after.text,[StringComparison]::Ordinal)) { $modified++ }
     }
+    return [pscustomobject]@{Added=$added; Modified=$modified; Deleted=$deleted; Total=($added+$modified+$deleted); Unknown=$unknown; Reasons=@($reasons); PathIds=@($paths.Keys)}
 }
 
-function Get-WorkspaceEntrySignature {
-    param([object]$Entry)
-
-    $kind = [string](Get-PropertyValue -Object $Entry -Name 'kind' -Default '')
-    if ([string]::Equals($kind, 'renamed', [StringComparison]::Ordinal)) {
-        $sourceId = [string](Get-PropertyValue -Object $Entry -Name 'sourceId' -Default '')
-        $targetId = [string](Get-PropertyValue -Object $Entry -Name 'targetId' -Default '')
-        return 'renamed|' + $sourceId + '|' + $targetId
-    }
-
-    $pathId = [string](Get-PropertyValue -Object $Entry -Name 'pathId' -Default '')
-    return $kind + '|' + $pathId
-}
-
-function Convert-WorkspaceEntryToOperation {
-    param(
-        [object]$Entry,
-        [bool]$WasRemovedFromFinal
-    )
-
-    $kind = [string](Get-PropertyValue -Object $Entry -Name 'kind' -Default '')
-    if ([string]::Equals($kind, 'renamed', [StringComparison]::Ordinal)) {
-        return [PSCustomObject][ordered]@{
-            kind = 'renamed'
-            sourceId = [string](Get-PropertyValue -Object $Entry -Name 'sourceId' -Default '')
-            targetId = [string](Get-PropertyValue -Object $Entry -Name 'targetId' -Default '')
-            source = 'git-status-delta'
-        }
-    }
-
-    $pathId = [string](Get-PropertyValue -Object $Entry -Name 'pathId' -Default '')
-    if ([string]::IsNullOrWhiteSpace($pathId)) {
-        return $null
-    }
-
-    $operationKind = $kind
-    if ($WasRemovedFromFinal) {
-        switch ($kind) {
-            'added' { $operationKind = 'deleted' }
-            'deleted' { $operationKind = 'modified' }
-            default { $operationKind = 'modified' }
-        }
-    }
-
-    return [PSCustomObject][ordered]@{
-        kind = $operationKind
-        pathId = $pathId
-        source = 'git-status-delta'
-    }
-}
-
-function Get-GitSnapshotDeltaOperations {
-    param(
-        [object]$Baseline,
-        [object]$Final
-    )
-
-    $operations = [System.Collections.Generic.List[object]]::new()
-    if ($null -eq $Baseline -or $null -eq $Final) {
-        return @($operations)
-    }
-    if (-not [bool](Get-PropertyValue -Object $Baseline -Name 'available' -Default $false) -or
-        -not [bool](Get-PropertyValue -Object $Final -Name 'available' -Default $false)) {
-        return @($operations)
-    }
-
-    $baselineRepositoryId = [string](Get-PropertyValue -Object $Baseline -Name 'repositoryId' -Default '')
-    $finalRepositoryId = [string](Get-PropertyValue -Object $Final -Name 'repositoryId' -Default '')
-    if (-not [string]::IsNullOrWhiteSpace($baselineRepositoryId) -and
-        -not [string]::IsNullOrWhiteSpace($finalRepositoryId) -and
-        -not [string]::Equals($baselineRepositoryId, $finalRepositoryId, [StringComparison]::Ordinal)) {
-        return @($operations)
-    }
-
-    $baselineBySignature = @{}
-    foreach ($entry in @((Get-PropertyValue -Object $Baseline -Name 'entries' -Default @()))) {
-        $signature = Get-WorkspaceEntrySignature -Entry $entry
-        if (-not [string]::IsNullOrWhiteSpace($signature) -and -not $baselineBySignature.ContainsKey($signature)) {
-            $baselineBySignature[$signature] = $entry
-        }
-    }
-
-    $finalBySignature = @{}
-    foreach ($entry in @((Get-PropertyValue -Object $Final -Name 'entries' -Default @()))) {
-        $signature = Get-WorkspaceEntrySignature -Entry $entry
-        if (-not [string]::IsNullOrWhiteSpace($signature) -and -not $finalBySignature.ContainsKey($signature)) {
-            $finalBySignature[$signature] = $entry
-        }
-    }
-
-    $finalTrackedPathIds = @{}
-    foreach ($pathId in @((Get-PropertyValue -Object $Final -Name 'trackedPathIds' -Default @()))) {
-        $pathIdText = [string]$pathId
-        if (-not [string]::IsNullOrWhiteSpace($pathIdText)) {
-            $finalTrackedPathIds[$pathIdText] = $true
-        }
-    }
-
-    foreach ($signature in $finalBySignature.Keys) {
-        if (-not $baselineBySignature.ContainsKey($signature)) {
-            $operation = Convert-WorkspaceEntryToOperation -Entry $finalBySignature[$signature] -WasRemovedFromFinal $false
-            if ($null -ne $operation) { $operations.Add($operation) }
-        }
-    }
-
-    foreach ($signature in $baselineBySignature.Keys) {
-        if (-not $finalBySignature.ContainsKey($signature)) {
-            $baselineEntry = $baselineBySignature[$signature]
-            $baselineKind = [string](Get-PropertyValue -Object $baselineEntry -Name 'kind' -Default '')
-            $baselinePathId = [string](Get-PropertyValue -Object $baselineEntry -Name 'pathId' -Default '')
-            if ([string]::Equals($baselineKind, 'added', [StringComparison]::Ordinal) -and
-                $finalTrackedPathIds.ContainsKey($baselinePathId)) {
-                continue
-            }
-            $operation = Convert-WorkspaceEntryToOperation -Entry $baselineEntry -WasRemovedFromFinal $true
-            if ($null -ne $operation) { $operations.Add($operation) }
-        }
-    }
-
-    return @($operations)
-}
-
-function Ensure-UnionNode {
-    param(
-        [hashtable]$Parent,
-        [string]$Node
-    )
-
-    if (-not [string]::IsNullOrWhiteSpace($Node) -and -not $Parent.ContainsKey($Node)) {
-        $Parent[$Node] = $Node
-    }
-}
-
-function Get-UnionRoot {
-    param(
-        [hashtable]$Parent,
-        [string]$Node
-    )
-
-    Ensure-UnionNode -Parent $Parent -Node $Node
-    if ([string]::IsNullOrWhiteSpace($Node)) {
-        return ''
-    }
-
-    $current = $Node
-    while (-not [string]::Equals([string]$Parent[$current], $current, [StringComparison]::Ordinal)) {
-        $current = [string]$Parent[$current]
-    }
-    $root = $current
-
-    $current = $Node
-    while (-not [string]::Equals([string]$Parent[$current], $current, [StringComparison]::Ordinal)) {
-        $next = [string]$Parent[$current]
-        $Parent[$current] = $root
-        $current = $next
-    }
-
-    return $root
-}
-
-function Merge-UnionNodes {
-    param(
-        [hashtable]$Parent,
-        [string]$Left,
-        [string]$Right
-    )
-
-    if ([string]::IsNullOrWhiteSpace($Left) -or [string]::IsNullOrWhiteSpace($Right)) {
-        return
-    }
-
-    $leftRoot = Get-UnionRoot -Parent $Parent -Node $Left
-    $rightRoot = Get-UnionRoot -Parent $Parent -Node $Right
-    if (-not [string]::Equals($leftRoot, $rightRoot, [StringComparison]::Ordinal)) {
-        $Parent[$rightRoot] = $leftRoot
-    }
-}
-
-function Get-FileChangeSummary {
-    param([object[]]$Operations)
-
-    $parent = @{}
-    foreach ($operation in @($Operations)) {
-        $kind = [string](Get-PropertyValue -Object $operation -Name 'kind' -Default '')
-        if ([string]::Equals($kind, 'renamed', [StringComparison]::Ordinal)) {
-            $sourceId = [string](Get-PropertyValue -Object $operation -Name 'sourceId' -Default '')
-            $targetId = [string](Get-PropertyValue -Object $operation -Name 'targetId' -Default '')
-            Ensure-UnionNode -Parent $parent -Node $sourceId
-            Ensure-UnionNode -Parent $parent -Node $targetId
-            # 重命名后以最终路径作为逻辑文件身份；链式 A→B→C 最终归并到 C。
-            Merge-UnionNodes -Parent $parent -Left $targetId -Right $sourceId
-        }
-        else {
-            Ensure-UnionNode -Parent $parent -Node ([string](Get-PropertyValue -Object $operation -Name 'pathId' -Default ''))
-        }
-    }
-
-    $flagsByRoot = @{}
-    $rootOrder = [System.Collections.ArrayList]::new()
-    foreach ($operation in @($Operations)) {
-        $kind = [string](Get-PropertyValue -Object $operation -Name 'kind' -Default '')
-        $nodeId = ''
-        if ([string]::Equals($kind, 'renamed', [StringComparison]::Ordinal)) {
-            $nodeId = [string](Get-PropertyValue -Object $operation -Name 'sourceId' -Default '')
-        }
-        else {
-            $nodeId = [string](Get-PropertyValue -Object $operation -Name 'pathId' -Default '')
-        }
-        if ([string]::IsNullOrWhiteSpace($nodeId)) {
-            continue
-        }
-
-        $root = Get-UnionRoot -Parent $parent -Node $nodeId
-        if (-not $flagsByRoot.ContainsKey($root)) {
-            $flagsByRoot[$root] = [ordered]@{
-                added = $false
-                modified = $false
-                deleted = $false
-                renamed = $false
-            }
-            $null = $rootOrder.Add($root)
-        }
-
-        switch ($kind) {
-            'added' { $flagsByRoot[$root].added = $true }
-            'deleted' { $flagsByRoot[$root].deleted = $true }
-            'renamed' {
-                $flagsByRoot[$root].renamed = $true
-                $flagsByRoot[$root].modified = $true
-            }
-            default { $flagsByRoot[$root].modified = $true }
-        }
-    }
-
-    $addedCount = 0
-    $modifiedCount = 0
-    $deletedCount = 0
-    foreach ($root in $rootOrder) {
-        $flags = $flagsByRoot[$root]
-        # A rename is one modified logical file. Its source and destination must
-        # never also contribute to Added or Deleted totals. A delete+add cycle on
-        # the same identity is likewise treated as replacement/modification.
-        if ([bool]$flags.renamed -or ([bool]$flags.added -and [bool]$flags.deleted)) {
-            $modifiedCount++
-        }
-        elseif ([bool]$flags.added) {
-            $addedCount++
-        }
-        elseif ([bool]$flags.deleted) {
-            $deletedCount++
-        }
-        else {
-            $modifiedCount++
-        }
-    }
-
-    return [PSCustomObject][ordered]@{
-        Added = $addedCount
-        Modified = $modifiedCount
-        Deleted = $deletedCount
-        Total = ($addedCount + $modifiedCount + $deletedCount)
-    }
-}
 
 function Normalize-SkillName {
     param([object]$Value)
@@ -3702,6 +3361,220 @@ if ($Event -eq 'SubagentStop') {
     }
 }
 
+function Get-TranscriptActivityObservation {
+    param([string]$Text, [string]$ExpectedTurnId, [string]$Cwd, [string]$Scope='root', [DateTimeOffset]$From=[DateTimeOffset]::MinValue, [DateTimeOffset]$Until=[DateTimeOffset]::MaxValue)
+    $paths = @{}
+    $edits = @{}
+    $calls = @{}
+    $spawns = @{}
+    $mcpCalls = @{}
+    $agentStarts = [ordered]@{}
+    $fileChanges = [Collections.Generic.List[object]]::new()
+    $agentIds = @{}
+    $currentTurn = $ExpectedTurnId
+    $errors = 0
+    $lineCount = 0
+    foreach ($line in ([string]$Text -split '\r?\n')) {
+        if (-not $line) { continue }
+        if (++$lineCount -gt 10000) { $errors++; break }
+        try {
+            $r = $line | ConvertFrom-Json
+            $p = Get-PropertyValue -Object $r -Name 'payload'
+            $topType = [string](Get-PropertyValue -Object $r -Name 'type')
+            $type = [string](Get-PropertyValue -Object $p -Name 'type')
+            $turn = Get-TranscriptRecordTurnId -Record $r
+            if ($topType -eq 'turn_context' -or ($topType -eq 'event_msg' -and $type -eq 'task_started')) { $currentTurn = $turn }
+            if ($ExpectedTurnId -and (($turn -and $turn -ne $ExpectedTurnId) -or $currentTurn -ne $ExpectedTurnId)) { continue }
+            $timeValue = Get-PropertyValue -Object $r -Name 'timestamp' -Default ''
+            $at = [DateTimeOffset]::MinValue
+            if ($timeValue) { $at = [DateTimeOffset]::Parse([string]$timeValue, [Globalization.CultureInfo]::InvariantCulture) }
+            if (-not $timeValue -and ($From -ne [DateTimeOffset]::MinValue -or $Until -ne [DateTimeOffset]::MaxValue)) {
+                $timedItem=Get-PropertyValue -Object $p -Name 'item'
+                $timedType=Get-PropertyValue -Object $timedItem -Name 'type'
+                if ($topType -eq 'event_msg' -and $type -eq 'item_completed' -and
+                    (($timedType -eq 'SubAgentActivity' -and (Get-PropertyValue -Object $timedItem -Name 'kind') -eq 'started') -or
+                    ($timedType -eq 'FileChange' -and (Get-PropertyValue -Object $timedItem -Name 'status') -eq 'completed'))) { $errors++ }
+                continue
+            }
+            if ($at -lt $From -or $at -gt $Until) { continue }
+            if ($topType -eq 'event_msg' -and $type -eq 'item_completed') {
+                $item = Get-PropertyValue -Object $p -Name 'item'
+                if ((Get-PropertyValue -Object $item -Name 'type') -eq 'McpToolCall' -and
+                    (Get-PropertyValue -Object $item -Name 'status') -in @('completed', 'failed')) {
+                    $id = Normalize-StableId -Value (Get-PropertyValue -Object $item -Name 'id') -Fallback ''
+                    $server = [string](Get-PropertyValue -Object $item -Name 'server')
+                    $tool = [string](Get-PropertyValue -Object $item -Name 'tool')
+                    if ($id -and -not [string]::IsNullOrWhiteSpace($server) -and -not [string]::IsNullOrWhiteSpace($tool)) {
+                        # Code-mode 内层 MCP 可能没有工具 Hook；用原生调用 ID 复用汇总去重，不保存参数和结果。
+                        $mcpCalls[$id] = [pscustomobject]@{
+                            event='PostToolUse'; toolName=('mcp__' + $server + '__' + $tool); toolUseId=$id
+                            at=[string]$timeValue; skillScope=$(if ($Scope -eq 'root') { 'root' } else { 'agent:' + $Scope })
+                        }
+                    }
+                }
+                if ((Get-PropertyValue -Object $item -Name 'type') -eq 'SubAgentActivity' -and
+                    (Get-PropertyValue -Object $item -Name 'kind') -eq 'started') {
+                    # interacted 的目标可能是父任务；只有 started 能证明新建了子 Agent。
+                    $childId = ConvertTo-V21SafeAgentId -Value (Get-PropertyValue -Object $item -Name 'agent_thread_id')
+                    if ($childId -and -not $agentStarts.Contains($childId)) {
+                        $metadata = Get-V21SafeSpawnMetadata -Payload ([pscustomobject]@{
+                            tool_response=[pscustomobject]@{task_name=(Get-PropertyValue -Object $item -Name 'agent_path')}
+                        })
+                        $agentIds[$childId]=$true
+                        $agentStarts[$childId] = [pscustomobject]@{
+                            event='SubagentStart'; agentId=$childId; agentType=$(if ($metadata.DisplayName) { $metadata.DisplayName } else { 'default' })
+                            at=[string]$timeValue; toolUseId=(Normalize-StableId -Value (Get-PropertyValue -Object $item -Name 'id') -Fallback '')
+                        }
+                    }
+                }
+                if ((Get-PropertyValue -Object $item -Name 'type') -eq 'FileChange' -and (Get-PropertyValue -Object $item -Name 'status') -eq 'completed') {
+                    $id = [string](Get-PropertyValue -Object $item -Name 'id')
+                    if (-not $id) { $errors++; continue }
+                    if ($edits.ContainsKey($id)) { continue }
+                    $edits[$id] = $true
+                    $changes = Get-PropertyValue -Object $item -Name 'changes'
+                    foreach ($property in $changes.PSObject.Properties) {
+                        $pathId = Get-FileIdentityHash -PathValue $property.Name -Cwd $Cwd
+                        if ($pathId) { $paths[$pathId] = $true }
+                        $fileChanges.Add([pscustomobject]@{Path=$property.Name; Detail=$property.Value; At=$at; Scope=$Scope; EditId=$id; Order=$lineCount; Cwd=$Cwd})
+                    }
+                }
+            }
+            if ($topType -ne 'response_item') { continue }
+            $callId = [string](Get-PropertyValue -Object $p -Name 'call_id')
+            if (-not $callId) { continue }
+            if ($type -eq 'function_call' -and (Test-V21SubagentSpawnToolName -ToolName ([string](Get-PropertyValue -Object $p -Name 'name')))) {
+                $inputValue = Get-PropertyValue -Object $p -Name 'arguments'
+                $metadata = Get-V21SafeSpawnMetadata -Payload ([pscustomobject]@{tool_input=$inputValue})
+                $calls[$callId] = $metadata
+            }
+            elseif ($type -eq 'function_call_output' -and $calls.ContainsKey($callId)) {
+                $outputValue = Get-PropertyValue -Object $p -Name 'output'
+                if ($outputValue -is [string]) { $outputValue = $outputValue | ConvertFrom-Json }
+                if ($null -eq $outputValue) { continue }
+                $toolPayload = [pscustomobject]@{tool_response=$outputValue}
+                if (-not (Test-V21SpawnPostSucceeded -Payload $toolPayload)) { continue }
+                $metadata = Get-V21SafeSpawnMetadata -Payload $toolPayload
+                # A parsable response alone is not proof of a successful spawn.
+                if (-not $metadata.AgentId -and -not $metadata.DisplayName) { continue }
+                $displayName = [string]$calls[$callId].DisplayName
+                if (-not $displayName) { $displayName = [string]$metadata.DisplayName }
+                $spawns[$callId] = [pscustomobject]@{
+                    event='PostToolUse'; toolName='spawn_agent'; toolUseId=$callId; success=$true
+                    at=[string](Get-PropertyValue -Object $r -Name 'timestamp')
+                    spawnObservation=$true; spawnSucceeded=$true; spawnAgentId=[string]$metadata.AgentId
+                    spawnDisplayName=$displayName; spawnDisplayNameSource='task_name'
+                }
+            }
+        }
+        catch { $errors++ }
+    }
+    foreach ($start in $agentStarts.Values) {
+        if (-not $start.toolUseId) { continue }
+        # 原生启动将调用 ID 与真实 Agent ID 绑定；补齐部分缺失的 Hook，并复用名称解析及去重。
+        $spawns[$start.toolUseId] = [pscustomobject]@{
+            event='PostToolUse'; toolName='spawn_agent'; toolUseId=$start.toolUseId; success=$true; at=$start.at
+            spawnObservation=$true; spawnSucceeded=$true; spawnAgentId=$start.agentId
+            spawnDisplayName=$start.agentType; spawnDisplayNameSource='task_name'
+        }
+    }
+    return [pscustomobject]@{PathIds=@($paths.Keys); EditIds=@($edits.Keys); EditCount=$edits.Count; Events=(@($spawns.Values) + @($mcpCalls.Values) + @($agentStarts.Values)); ParseErrors=$errors; FileChanges=@($fileChanges); AgentIds=@($agentIds.Keys); Reasons=@()}
+}
+
+function Get-MainTranscriptActivityObservation {
+    param([object]$State, [object]$StopPayload)
+    $empty = [pscustomobject]@{PathIds=@(); EditCount=0; Events=@(); FileChanges=@(); AgentIds=@(); Reasons=@('主任务文件变更记录不可用'); Incomplete=$true}
+    if (-not (Get-PropertyValue -Object $State -Name 'transcriptBaselineCaptured' -Default $false)) { return $empty }
+    $path = [string](Get-PropertyValue -Object $StopPayload -Name 'transcript_path')
+    if (-not $path -or (Get-FileIdentityHash -PathValue $path -Cwd '') -ne (Get-PropertyValue -Object $State -Name 'transcriptIdentityHash')) { return $empty }
+    try {
+        $slice = Read-TranscriptSlice -Path $path -StartOffset ([Int64](Get-PropertyValue -Object $State -Name 'transcriptBaselineBytes' -Default 0))
+        # A rewritten file has no trusted implicit turn boundary.
+        $text = [string]$slice.Text
+        if ($slice.Rewritten) { return $empty }
+        $result = Get-TranscriptActivityObservation -Text $text -ExpectedTurnId ([string](Get-PropertyValue -Object $State -Name 'turnId')) -Cwd ([string](Get-PropertyValue -Object $StopPayload -Name 'cwd'))
+        $result | Add-Member -NotePropertyName Incomplete -NotePropertyValue ([bool]$slice.Truncated -or $result.ParseErrors -gt 0)
+        if ($result.Incomplete) { $result.Reasons=@('主任务文件变更记录截断或解析失败') }
+        return $result
+    }
+    catch { $empty.Incomplete = $true; return $empty }
+}
+
+function Add-ChildFileActivity {
+    param([object]$Observation, [object[]]$Events, [object]$State, [object]$StopPayload, [DateTimeOffset]$EndedAt)
+    $queue = [Collections.Generic.Queue[object]]::new()
+    $parentId = [string](Get-PropertyValue -Object $State -Name 'sessionId')
+    foreach ($id in @((Get-PropertyValue -Object $Observation -Name 'AgentIds' -Default @())) + @($Events | Where-Object { (Get-PropertyValue -Object $_ -Name 'event') -in @('SubagentStart','SubagentStop') } | ForEach-Object { Get-PropertyValue -Object $_ -Name 'agentId' })) {
+        if ($id) { $queue.Enqueue(@{id=[string]$id; parent=$parentId}) }
+    }
+    if ($queue.Count -eq 0) { return $Observation }
+    $changes = [Collections.Generic.List[object]]::new()
+    foreach ($change in @((Get-PropertyValue -Object $Observation -Name 'FileChanges' -Default @()))) { $changes.Add($change) }
+    $reasons = [Collections.Generic.List[string]]::new()
+    foreach ($reason in @((Get-PropertyValue -Object $Observation -Name 'Reasons' -Default @()))) { $reasons.Add([string]$reason) }
+    $seen = @{}; $childEdits = @{}
+    $transcriptPath=[string](Get-PropertyValue -Object $StopPayload -Name 'transcript_path')
+    $directory = if ($transcriptPath) { Split-Path -Parent $transcriptPath } else { '' }
+    $start = [DateTimeOffset]::Parse([string](Get-PropertyValue -Object $State -Name 'startedAt'),[Globalization.CultureInfo]::InvariantCulture)
+    $watch = [Diagnostics.Stopwatch]::StartNew()
+    while ($queue.Count -gt 0) {
+        $agent = $queue.Dequeue()
+        if ($seen.ContainsKey($agent.id)) { continue }
+        $seen[$agent.id]=$true
+        if ($seen.Count -gt 16 -or $watch.ElapsedMilliseconds -gt 2000) { $reasons.Add('子Agent文件记录读取超出预算'); break }
+        try {
+            if ($agent.id -notmatch '^[A-Za-z0-9_-]{1,200}$' -or -not $directory) { throw 'unavailable-child-identity' }
+            # Only the known transcript directory, never a workspace or session-tree scan.
+            $matches = @(Get-ChildItem -LiteralPath $directory -Filter ('*-' + $agent.id + '.jsonl') -File)
+            if ($matches.Count -ne 1) { throw 'child-transcript-unavailable' }
+            $header = Read-TranscriptSlice -Path $matches[0].FullName -StartOffset 0 -EndOffset 65536
+            $meta = (([string]$header.Text -split '\r?\n',2)[0] | ConvertFrom-Json)
+            $identity = Get-PropertyValue -Object $meta -Name 'payload'
+            $spawn = Get-PropertyValue -Object (Get-PropertyValue -Object (Get-PropertyValue -Object $identity -Name 'source') -Name 'subagent') -Name 'thread_spawn'
+            if ((Get-PropertyValue -Object $meta -Name 'type') -ne 'session_meta' -or (Get-PropertyValue -Object $identity -Name 'id') -ne $agent.id -or (Get-PropertyValue -Object $spawn -Name 'parent_thread_id') -ne $agent.parent) { throw 'child-identity-mismatch' }
+            $slice = Read-TranscriptSlice -Path $matches[0].FullName -StartOffset 0
+            $childCwd = [string](Get-PropertyValue -Object $identity -Name 'cwd' -Default (Get-PropertyValue -Object $StopPayload -Name 'cwd'))
+            $child = Get-TranscriptActivityObservation -Text $slice.Text -ExpectedTurnId '' -Cwd $childCwd -Scope $agent.id -From $start -Until $EndedAt
+            foreach ($change in $child.FileChanges) { $changes.Add($change); $childEdits[$agent.id+"`n"+$change.EditId]=$true }
+            foreach ($id in $child.AgentIds) { $queue.Enqueue(@{id=$id; parent=$agent.id}) }
+            if ($slice.Truncated -or $child.ParseErrors -gt 0) { throw 'incomplete-child-transcript' }
+        }
+        catch { if (-not $reasons.Contains('子Agent文件记录缺失、身份不匹配、截断或解析失败')) { $reasons.Add('子Agent文件记录缺失、身份不匹配、截断或解析失败') } }
+    }
+    Set-PropertyValue -Object $Observation -Name 'FileChanges' -Value @($changes | Sort-Object At,Order)
+    Set-PropertyValue -Object $Observation -Name 'Reasons' -Value @($reasons)
+    Set-PropertyValue -Object $Observation -Name 'ChildEditCount' -Value $childEdits.Count
+    if ($reasons.Count -gt 0) { Set-PropertyValue -Object $Observation -Name 'Incomplete' -Value $true }
+    return $Observation
+}
+
+function Get-SubagentTranscriptDisplayName {
+    param([object]$AgentPayload)
+    $path = [string](Get-PropertyValue -Object $AgentPayload -Name 'agent_transcript_path' -Default '')
+    if (-not $path -or -not (Test-Path -LiteralPath $path -PathType Leaf)) { return '' }
+    try {
+        # A bounded metadata read avoids parsing/encrypting child conversation text.
+        $slice = Read-TranscriptSlice -Path $path -StartOffset 0 -EndOffset 65536
+        $firstLine = ([string]$slice.Text -split '\r?\n', 2)[0]
+        $record = $firstLine | ConvertFrom-Json
+        if ((Get-PropertyValue -Object $record -Name 'type') -ne 'session_meta') { return '' }
+        $meta = Get-PropertyValue -Object $record -Name 'payload'
+        $id = [string](Get-PropertyValue -Object $meta -Name 'id')
+        $expectedId = [string](Get-PropertyValue -Object $AgentPayload -Name 'agent_id')
+        if (-not $id -or -not $expectedId -or $id -ne $expectedId) { return '' }
+        $source = Get-PropertyValue -Object $meta -Name 'source'
+        $spawn = Get-PropertyValue -Object (Get-PropertyValue -Object $source -Name 'subagent') -Name 'thread_spawn'
+        $parent = [string](Get-PropertyValue -Object $spawn -Name 'parent_thread_id')
+        if ($parent -ne [string](Get-PropertyValue -Object $AgentPayload -Name 'session_id')) { return '' }
+        $agentPath = [string](Get-PropertyValue -Object $spawn -Name 'agent_path')
+        if ($agentPath -match '^/root/(?:[A-Za-z0-9_-]+/)*([A-Za-z0-9_-]+)$') {
+            return ConvertTo-V21SafeSubagentDisplayName -Value $Matches[1] -Source 'task_name'
+        }
+    }
+    catch { }
+    return ''
+}
+
 function New-RunState {
     param(
         [DateTimeOffset]$StartedAt,
@@ -3718,7 +3591,6 @@ function New-RunState {
 
     $transcriptBaseline = Get-TranscriptBaselineMetadata -PathValue (Get-PropertyValue -Object $Payload -Name 'transcript_path' -Default $null)
     $cwd = [string](Get-PropertyValue -Object $Payload -Name 'cwd' -Default '')
-    $workspaceBaseline = Get-GitWorkspaceSnapshot -Cwd $cwd
 
     return [ordered]@{
         schemaVersion = 11
@@ -3738,8 +3610,7 @@ function New-RunState {
         transcriptBaselineBytes = ([Int64]$transcriptBaseline.BaselineBytes).ToString([Globalization.CultureInfo]::InvariantCulture)
         transcriptBaselineCaptured = (-not [string]::IsNullOrWhiteSpace([string]$transcriptBaseline.IdentityHash))
         transcriptExistedAtStart = [bool]$transcriptBaseline.Available
-        workspaceBaseline = $workspaceBaseline
-        fileCollectionMode = 'apply_patch + Git状态差异'
+        fileCollectionMode = '成功 FileChange 记录与涉及文件内容核验'
         commandLoggingMode = Get-CommandLoggingMode
         programVersion = $ProgramVersion
         createdAt = [DateTimeOffset]::Now.ToString('o')
@@ -3754,8 +3625,7 @@ function Ensure-RunState {
         return $state
     }
 
-    $now = [DateTimeOffset]::Now
-    $newState = New-RunState -StartedAt $now -StartMonotonicTicks ([Diagnostics.Stopwatch]::GetTimestamp()) -StartSource $Source
+    $newState = New-RunState -StartedAt $eventReceivedAt -StartMonotonicTicks ([Diagnostics.Stopwatch]::GetTimestamp()) -StartSource $Source
     Write-Utf8FileAtomic -Path $statePath -Content ($newState | ConvertTo-Json -Compress -Depth 10)
     return Read-JsonFile -Path $statePath
 }
@@ -3766,6 +3636,8 @@ function New-JournalEvent {
         at = [DateTimeOffset]::Now.ToString('o')
         monotonicTicks = ([Diagnostics.Stopwatch]::GetTimestamp()).ToString([Globalization.CultureInfo]::InvariantCulture)
     }
+    $eventAgentId = Normalize-StableId -Value (Get-PropertyValue -Object $Payload -Name 'agent_id' -Default '') -Fallback ''
+    if ($eventAgentId) { $record.skillScope = 'agent:' + $eventAgentId }
 
     switch ($Event) {
         'PreToolUse' {
@@ -3818,6 +3690,8 @@ function New-JournalEvent {
         'SubagentStop' {
             $record.agentId = Normalize-StableId -Value (Get-PropertyValue -Object $Payload -Name 'agent_id' -Default '') -Fallback ''
             $record.agentType = Sanitize-DisplayName -Value (Get-PropertyValue -Object $Payload -Name 'agent_type' -Default '') -Fallback '未命名Agent'
+            $displayName = Get-SubagentTranscriptDisplayName -AgentPayload $Payload
+            if ($displayName) { $record.agentType = $displayName; $record.agentDisplayNameSource = 'child-session-metadata' }
             $record.structuredSkills = @(Get-StructuredSkillNames -Value $Payload -Strict)
             if ($null -ne $SubagentSkillObservation) {
                 $record.transcriptSkills = @((Get-PropertyValue -Object $SubagentSkillObservation -Name 'SkillNames' -Default @()))
@@ -3840,15 +3714,24 @@ function New-JournalEvent {
 }
 
 function Append-CurrentEvent {
-    $null = Invoke-WithMutex -Name $runMutexName -TimeoutMs 5000 -ScriptBlock {
+    # Parse outside the lock. A missing prompt must not scan the workspace while
+    # holding the same lock that a new prompt needs to acquire.
+    if (Test-Path -LiteralPath $completedPath) { return }
+    $journalEvent = New-JournalEvent
+    $preparedState = $null
+    if ($null -eq (Read-JsonFile -Path $statePath)) {
+        $preparedState = New-RunState -StartedAt $eventReceivedAt -StartMonotonicTicks ([Diagnostics.Stopwatch]::GetTimestamp()) -StartSource 'inferred-from-intermediate-event'
+    }
+    $null = Invoke-WithMutex -Name $runMutexName -TimeoutMs 1000 -ScriptBlock {
         # A late asynchronous collector may start after Stop has finalized.
         # Ignore it instead of recreating orphaned state for an already completed turn.
         if (Test-Path -LiteralPath $completedPath) {
             return
         }
 
-        $null = Ensure-RunState -Source 'inferred-from-intermediate-event'
-        $journalEvent = New-JournalEvent
+        if ($null -eq (Read-JsonFile -Path $statePath) -and $null -ne $preparedState) {
+            Write-Utf8FileAtomic -Path $statePath -Content ($preparedState | ConvertTo-Json -Compress -Depth 10)
+        }
         Append-Utf8Line -Path $journalPath -Line ($journalEvent | ConvertTo-Json -Compress -Depth 8)
     }
 }
@@ -3944,8 +3827,8 @@ function Build-Summary {
         [DateTimeOffset]$EndedAt,
         [Int64]$EndMonotonicTicks,
         [object]$StopPayload,
-        [object]$EndWorkspaceSnapshot,
-        [object]$MainSkillObservation
+        [object]$MainSkillObservation,
+        [object]$ActivityObservation = $null
     )
 
     $mcpCounts = @{}
@@ -3957,6 +3840,7 @@ function Build-Summary {
     $agentCounts = @{}
     $agentOrder = [System.Collections.ArrayList]::new()
     $fileOperations = [System.Collections.Generic.List[object]]::new()
+    $fileEditsByPath = @{}
     $gitRunCount = 0
     $gitInstructionCount = 0
     $gitChangeCount = 0
@@ -3995,6 +3879,8 @@ function Build-Summary {
     $syntheticAgentIndex = 0
     $editOperationCount = 0
     $unparsedEditOperationCount = 0
+    $rootEditIds = @{}
+    $childEditIds = @{}
 
     foreach ($journalEvent in $Events) {
         $eventName = [string](Get-PropertyValue -Object $journalEvent -Name 'event' -Default '')
@@ -4007,6 +3893,8 @@ function Build-Summary {
             $syntheticPreIndex++
             $toolUseId = 'pre-synthetic-' + $syntheticPreIndex
         }
+        $eventScope = [string](Get-PropertyValue -Object $journalEvent -Name 'skillScope' -Default 'root')
+        $toolUseId = $eventScope + "`n" + $toolUseId
         if (-not $preToolById.ContainsKey($toolUseId)) {
             $preToolById[$toolUseId] = $journalEvent
         }
@@ -4021,6 +3909,8 @@ function Build-Summary {
                     $syntheticPostIndex++
                     $toolUseId = 'post-synthetic-' + $syntheticPostIndex
                 }
+                $eventScope = [string](Get-PropertyValue -Object $journalEvent -Name 'skillScope' -Default 'root')
+                $toolUseId = $eventScope + "`n" + $toolUseId
                 if ($completedToolIds.ContainsKey($toolUseId)) { continue }
                 $completedToolIds[$toolUseId] = $true
 
@@ -4030,7 +3920,8 @@ function Build-Summary {
                     $commandReadSkills = @((Get-PropertyValue -Object $preToolById[$toolUseId] -Name 'commandReadSkills' -Default @()))
                 }
                 foreach ($name in $commandReadSkills) {
-                    Add-SkillEvidence -EvidenceByKey $skillEvidenceByKey -EvidenceOrder $skillEvidenceOrder -NameValue $name -ScopeKey 'root' -Source 'Hook工具调用－读取 SKILL.md' -Level 'read' -Priority 30
+                    $toolSkillScope = [string](Get-PropertyValue -Object $journalEvent -Name 'skillScope' -Default 'root')
+                    Add-SkillEvidence -EvidenceByKey $skillEvidenceByKey -EvidenceOrder $skillEvidenceOrder -NameValue $name -ScopeKey $toolSkillScope -Source 'Hook工具调用－读取 SKILL.md' -Level 'read' -Priority 30
                 }
 
                 if (Test-IsCommandExecutionTool -ToolName $toolName) {
@@ -4094,6 +3985,7 @@ function Build-Summary {
 
                 if (Test-IsApplyPatchTool -ToolName $toolName) {
                     $editOperationCount++
+                    if ($eventScope -eq 'root') { $rootEditIds[$toolUseId] = $true } else { $childEditIds[$toolUseId] = $true }
                     $operations = @((Get-PropertyValue -Object $journalEvent -Name 'fileOperations' -Default @()))
                     if ($operations.Count -eq 0 -and $preToolById.ContainsKey($toolUseId)) {
                         $operations = @((Get-PropertyValue -Object $preToolById[$toolUseId] -Name 'fileOperations' -Default @()))
@@ -4101,8 +3993,17 @@ function Build-Summary {
                     if ($operations.Count -eq 0) {
                         $unparsedEditOperationCount++
                     }
-                    else {
-                        foreach ($operation in $operations) { $fileOperations.Add($operation) }
+                    elseif ($false -ne (Get-PropertyValue -Object $journalEvent -Name 'success' -Default $true)) {
+                        foreach ($operation in $operations) {
+                            $fileOperations.Add($operation)
+                            foreach ($property in @('pathId','sourceId','targetId')) {
+                                $pathId=[string](Get-PropertyValue -Object $operation -Name $property -Default '')
+                                if (-not $pathId) { continue }
+                                $key=$eventScope+"`n"+$pathId
+                                if (-not $fileEditsByPath.ContainsKey($key)) { $fileEditsByPath[$key]=@{scope=$eventScope;pathId=$pathId;ids=@{}} }
+                                $fileEditsByPath[$key].ids[$toolUseId]=$true
+                            }
+                        }
                     }
                     continue
                 }
@@ -4159,8 +4060,9 @@ function Build-Summary {
                 else {
                     $agentsById[$agentId].stopped = $true
                     $incomingType = Sanitize-DisplayName -Value (Get-PropertyValue -Object $journalEvent -Name 'agentType' -Default '') -Fallback '未命名Agent'
-                    if ([string]::Equals([string]$agentsById[$agentId].type, '未命名Agent', [StringComparison]::OrdinalIgnoreCase) -and
-                        -not [string]::Equals($incomingType, '未命名Agent', [StringComparison]::OrdinalIgnoreCase)) {
+                    if (((Test-V21WeakAgentType -Value $agentsById[$agentId].type) -or
+                        (Get-PropertyValue -Object $journalEvent -Name 'agentDisplayNameSource') -eq 'child-session-metadata') -and
+                        -not (Test-V21WeakAgentType -Value $incomingType)) {
                         $agentsById[$agentId].type = $incomingType
                     }
                 }
@@ -4217,11 +4119,10 @@ function Build-Summary {
     }
     # v1.7+：缺少 SubagentStop 不再视为未完成；SubagentStart 即为计数依据。
 
-    $baselineSnapshot = Get-PropertyValue -Object $State -Name 'workspaceBaseline' -Default $null
-    foreach ($operation in @(Get-GitSnapshotDeltaOperations -Baseline $baselineSnapshot -Final $EndWorkspaceSnapshot)) {
-        $fileOperations.Add($operation)
-    }
-    $fileSummary = Get-FileChangeSummary -Operations @($fileOperations)
+    $fileTrackingEnabled = [bool](Get-ConfigValue -Config $config -Path @('fileTracking','enabled') -Default $true)
+    $nativeChanges = if ($fileTrackingEnabled) { @((Get-PropertyValue -Object $ActivityObservation -Name 'FileChanges' -Default @())) } else { @() }
+    $requiredEdits=@($fileEditsByPath.Values | ForEach-Object { [pscustomobject]@{scope=$_.scope;pathId=$_.pathId;count=$_.ids.Count} })
+    $fileSummary = Get-NativeFileChangeSummary -Changes @($nativeChanges) -Cwd ([string](Get-PropertyValue -Object $StopPayload -Name 'cwd' -Default '')) -RequiredEdits $requiredEdits
 
     $fileCounts = @{}
     $fileOrder = [System.Collections.ArrayList]::new()
@@ -4230,17 +4131,34 @@ function Build-Summary {
     if ([int]$fileSummary.Deleted -gt 0) { Add-OrderedCount -Counts $fileCounts -Order $fileOrder -Name '删除' -Increment ([int]$fileSummary.Deleted) }
 
     $fileSources = [System.Collections.Generic.List[string]]::new()
-    if ($editOperationCount -gt 0) { $fileSources.Add('apply_patch') }
-    foreach ($operation in @($fileOperations)) {
-        if ([string]::Equals([string](Get-PropertyValue -Object $operation -Name 'source' -Default ''), 'shell-move', [StringComparison]::Ordinal)) {
-            if (-not $fileSources.Contains('命令重命名/移动')) { $fileSources.Add('命令重命名/移动') }
-            break
+    $fileSources.Add('成功 FileChange 记录与涉及文件内容核验')
+    $fileReasons = [Collections.Generic.List[string]]::new()
+    foreach ($reason in @($fileSummary.Reasons) + @((Get-PropertyValue -Object $ActivityObservation -Name 'Reasons' -Default @()))) { if ($reason -and -not $fileReasons.Contains([string]$reason)) { $fileReasons.Add([string]$reason) } }
+    if ($null -eq $ActivityObservation) { $fileReasons.Add('文件变更记录不可用') }
+    if ([string](Get-PropertyValue -Object $State -Name 'startSource') -ne 'UserPromptSubmit') { $fileReasons.Add('缺少本次回答的起始记录') }
+    $knownPaths = @{}; foreach ($id in $fileSummary.PathIds) { $knownPaths[$id]=$true }
+    foreach ($operation in $fileOperations) {
+        foreach ($property in @('pathId','sourceId','targetId')) {
+            $id=[string](Get-PropertyValue -Object $operation -Name $property -Default '')
+            if ($id -and -not $knownPaths.ContainsKey($id) -and -not $fileReasons.Contains('存在未匹配原生记录的编辑或移动事件')) { $fileReasons.Add('存在未匹配原生记录的编辑或移动事件') }
         }
     }
-    $baselineAvailable = $null -ne $baselineSnapshot -and [bool](Get-PropertyValue -Object $baselineSnapshot -Name 'available' -Default $false)
-    $finalAvailable = $null -ne $EndWorkspaceSnapshot -and [bool](Get-PropertyValue -Object $EndWorkspaceSnapshot -Name 'available' -Default $false)
-    if ($baselineAvailable -and $finalAvailable) { $fileSources.Add('Git状态差异') }
-    if ($fileSources.Count -eq 0) { $fileSources.Add('无可用来源') }
+    $fileIncomplete = $fileReasons.Count -gt 0 -or $fileSummary.Unknown -gt 0
+    $transcriptEdits = [int](Get-PropertyValue -Object $ActivityObservation -Name 'EditCount' -Default 0)
+    $editOperationCount = $childEditIds.Count + [Math]::Max($rootEditIds.Count, $transcriptEdits)
+    $editOperationLowerBound = $false
+    if ($rootEditIds.Count -gt 0 -and $transcriptEdits -gt 0) {
+        $matchedEdits = 0
+        foreach ($id in @((Get-PropertyValue -Object $ActivityObservation -Name 'EditIds' -Default @()))) {
+            if ($rootEditIds.ContainsKey("root`n" + $id)) { $matchedEdits++ }
+        }
+        $editOperationLowerBound = $matchedEdits -ne $rootEditIds.Count -or $matchedEdits -ne $transcriptEdits
+    }
+    if (Get-PropertyValue -Object $ActivityObservation -Name 'Incomplete' -Default $false) {
+        $fileIncomplete = $true
+        if ($fileReasons.Count -eq 0) { $fileReasons.Add('原生文件变更记录不完整') }
+    }
+    if (-not $fileTrackingEnabled) { $fileIncomplete=$false; $fileReasons.Clear() }
 
     $startText = [string](Get-PropertyValue -Object $State -Name 'startedAt' -Default '')
     $startedAt = $EndedAt
@@ -4263,6 +4181,9 @@ function Build-Summary {
     }
     elseif ($hasReliableStart) {
         $durationMs = ($EndedAt - $startedAt).TotalMilliseconds
+    }
+    if ($hasReliableStart) {
+        $durationMs = [Math]::Max(0, ($EndedAt - $startedAt).TotalMilliseconds)
     }
     if ($TestDurationMilliseconds -ge 0) { $durationMs = $TestDurationMilliseconds }
 
@@ -4293,7 +4214,7 @@ function Build-Summary {
     $status = Resolve-TurnStatus -StopPayload $StopPayload
     $endDisplay = Format-DisplayTime -Time $EndedAt -OtherTime $startedAt
     $durationDisplay = Format-Duration -Milliseconds $durationMs
-    $firstLine = "结束 $endDisplay（耗时 $durationDisplay）"
+    $firstLine = "结束 $endDisplay（用时 $durationDisplay）"
     $showSuccessStatus = [bool](Get-ConfigValue -Config $config -Path @('display', 'showSuccessStatus') -Default $false)
     if ($status.Code -ne 'completed' -or $showSuccessStatus) { $firstLine += '｜状态：' + $status.Display }
 
@@ -4312,19 +4233,23 @@ function Build-Summary {
     $otherLogLine = Format-CountLine -Label $labelOther -Counts $otherCounts -Order $otherOrder -EmptyValue $emptyValue
 
     $lines = [System.Collections.Generic.List[string]]::new()
+    if ($fileIncomplete) {
+        if ($fileOrder.Count -eq 0) { $fileClientLine = Format-CountLine -Label $labelFile -Counts $fileCounts -Order $fileOrder -EmptyValue '未确认' -HighlightStyle $highlightStyle -Icon $iconFile }
+        $fileClientLine += '（统计不完整）'
+    }
     $lines.Add($firstLine)
     $hideEmptyCategories = [bool](Get-ConfigValue -Config $config -Path @('display', 'hideEmptyCategories') -Default $true)
     if (-not $hideEmptyCategories -or $mcpOrder.Count -gt 0) { $lines.Add($mcpClientLine) }
     if (-not $hideEmptyCategories -or $skillOrder.Count -gt 0) { $lines.Add($skillClientLine) }
     if (-not $hideEmptyCategories -or $agentOrder.Count -gt 0) { $lines.Add($agentClientLine) }
-    if (-not $hideEmptyCategories -or $fileOrder.Count -gt 0) { $lines.Add($fileClientLine) }
+    if (-not $hideEmptyCategories -or $fileOrder.Count -gt 0 -or $fileIncomplete) { $lines.Add($fileClientLine) }
     if (-not $hideEmptyCategories -or $gitRunCount -gt 0) { $lines.Add($gitClientLine) }
     if (-not $hideEmptyCategories -or $otherOrder.Count -gt 0) { $lines.Add($otherClientLine) }
 
     $coverageLimitations = @(
         'Skill 依赖结构化注入、transcript 或 SKILL.md 读取证据，格式变化或缺失可能导致遗漏',
         '托管工具可能没有完整的标准 Hook 事件',
-        'Shell 产生的文件变更可能无法完全归因',
+        '文件仅统计成功 FileChange 记录；未报告变更的工具可能遗漏，文本比较统一 CRLF/LF，不保存原文或补丁',
         '命令日志只保存安全处理后的内容，疑似敏感或无法安全解析的参数会被隐藏'
     )
     $coverageText = '部分｜' + ($coverageLimitations -join '；')
@@ -4387,10 +4312,15 @@ function Build-Summary {
         CommandLoggingMode = $commandLoggingMode
         EmptyValue = $emptyValue
         FileChangeCount = [int]$fileSummary.Total
+        InputCount = [int](Get-PropertyValue -Object $State -Name 'promptCount' -Default 0)
+        PromptPreparationMs = [long](Get-PropertyValue -Object $State -Name 'promptPreparationMs' -Default 0)
+        PromptLockWaitMs = [long](Get-PropertyValue -Object $State -Name 'promptLockWaitMs' -Default 0)
         EditOperationCount = $editOperationCount
+        EditOperationLowerBound = $editOperationLowerBound
         UnparsedEditOperationCount = $unparsedEditOperationCount
         FileCollectionSource = ($fileSources -join ' + ')
-        FileCoverage = '部分'
+        FileCoverage = $(if ($fileIncomplete) { '部分' } else { '已采集原生记录范围内已核验' })
+        FileCoverageReasons = @($fileReasons)
         SkillCollectionMode = '多源识别'
         SkillCollectionSource = $skillCollectionSource
         SkillEvidenceLevel = $skillEvidenceLevel
@@ -4404,8 +4334,43 @@ function Build-Summary {
     }
 }
 
+function Complete-PendingSummary {
+    param([object]$Completed, [switch]$Retry)
+
+    if (-not [bool](Get-PropertyValue -Object $Completed -Name 'logPending' -Default $false)) {
+        return [pscustomobject]@{Summary=[string]$Completed.summary}
+    }
+    $built = Get-PropertyValue -Object $Completed -Name 'pendingSummary' -Default $null
+    foreach ($name in @('StartedAt', 'EndedAt')) {
+        Set-PropertyValue -Object $built -Name $name -Value ([DateTimeOffset]::Parse([string](Get-PropertyValue -Object $built -Name $name), [Globalization.CultureInfo]::InvariantCulture))
+    }
+    try {
+        $logPath = Write-DailyLog -SummaryObject $built -Retry:$Retry
+    }
+    catch {
+        Write-DebugRecord -Message '每日日志写入失败，已保留待补写汇总。' -ExceptionObject $_.Exception
+        return [pscustomobject]@{Summary=([string]$Completed.summary + '｜日志写入失败，统计已保留，等待重试')}
+    }
+
+    $done = [ordered]@{}
+    foreach ($name in @('schemaVersion', 'programVersion', 'sessionId', 'turnId', 'completedAt', 'status', 'statusSource', 'summary')) {
+        $done[$name] = Get-PropertyValue -Object $Completed -Name $name
+    }
+    $done.logFileName = if ($logPath) { [IO.Path]::GetFileName($logPath) } else { $null }
+    Write-Utf8FileAtomic -Path $completedPath -Content ($done | ConvertTo-Json -Compress -Depth 10)
+    Remove-Item -LiteralPath $statePath -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $journalPath -Force -ErrorAction SilentlyContinue
+    foreach ($hash in @((Get-PropertyValue -Object $Completed -Name 'mergedRunHashes' -Default @()))) {
+        if ([string]$hash -notmatch '^[a-f0-9]{64}$') { continue }
+        Remove-Item -LiteralPath (Join-Path $stateRoot ($hash + '.json')) -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath (Join-Path $journalRoot ($hash + '.jsonl')) -Force -ErrorAction SilentlyContinue
+    }
+    return [pscustomobject]@{Summary=[string]$done.summary}
+}
+
+
 function Write-DailyLog {
-    param([object]$SummaryObject)
+    param([object]$SummaryObject, [switch]$Retry)
 
     if (-not [bool](Get-ConfigValue -Config $config -Path @('logging', 'enabled') -Default $true)) {
         return $null
@@ -4414,6 +4379,7 @@ function Write-DailyLog {
     $prefix = Sanitize-FileNameComponent -Value (Get-ConfigValue -Config $config -Path @('logging', 'filePrefix') -Default 'codex-task') -Fallback 'codex-task'
     $fileName = $prefix + '-' + $SummaryObject.EndedAt.ToLocalTime().ToString('yyyy-MM-dd') + '.log'
     $logPath = Join-Path $logsRoot $fileName
+    $completionMarker = '记录完成：' + $runHash
 
     $startFull = $SummaryObject.StartedAt.ToLocalTime().ToString('yyyy-MM-dd HH:mm:ss zzz')
     $endFull = $SummaryObject.EndedAt.ToLocalTime().ToString('yyyy-MM-dd HH:mm:ss zzz')
@@ -4429,8 +4395,12 @@ function Write-DailyLog {
     $lines.Add('turn_id：' + $TurnId)
     $lines.Add('开始时间：' + $startFull)
     $lines.Add('结束时间：' + $endFull)
-    $lines.Add('原始耗时毫秒：' + $durationMillisecondsText)
-    $lines.Add('耗时：' + $SummaryObject.DurationDisplay)
+    $lines.Add('原始用时毫秒：' + $durationMillisecondsText)
+    $lines.Add('用时：' + $SummaryObject.DurationDisplay)
+    if ([int](Get-PropertyValue -Object $SummaryObject -Name 'InputCount' -Default 0) -gt 0) {
+        $lines.Add('本次回答输入次数：' + $SummaryObject.InputCount)
+        $lines.Add('末次输入准备/锁等待毫秒：' + $SummaryObject.PromptPreparationMs + '/' + $SummaryObject.PromptLockWaitMs)
+    }
     $lines.Add('')
 
     $lines.Add('【执行结果】')
@@ -4461,10 +4431,13 @@ function Write-DailyLog {
     $lines.Add('【文件变更】')
     Add-LogCountCategory -Lines $lines -Label '文件' -Items @($SummaryObject.FileItems) -EmptyValue $SummaryObject.EmptyValue
     $lines.Add('文件变更总数：' + $SummaryObject.FileChangeCount)
-    $lines.Add('编辑操作次数：' + $SummaryObject.EditOperationCount)
+    if (Get-PropertyValue -Object $SummaryObject -Name 'EditOperationLowerBound' -Default $false) {
+        $lines.Add('编辑操作次数：至少 ' + $SummaryObject.EditOperationCount + '（跨来源去重证据不足）')
+    } else { $lines.Add('编辑操作次数：' + $SummaryObject.EditOperationCount) }
     $lines.Add('未解析编辑操作：' + $SummaryObject.UnparsedEditOperationCount)
     $lines.Add('文件采集来源：' + $SummaryObject.FileCollectionSource)
     $lines.Add('文件统计完整性：' + $SummaryObject.FileCoverage)
+    foreach ($reason in @((Get-PropertyValue -Object $SummaryObject -Name 'FileCoverageReasons' -Default @()))) { $lines.Add('文件统计限制：' + [string]$reason) }
     $lines.Add('')
 
     $lines.Add('【Skill采集】')
@@ -4483,19 +4456,35 @@ function Write-DailyLog {
         $lines.Add('  - ' + [string]$limitation)
     }
     $lines.Add('================================================================================')
+    $lines.Add($completionMarker)
     $lines.Add('')
 
     $block = $lines -join [Environment]::NewLine
     $null = Invoke-WithMutex -Name $dailyLogMutexName -TimeoutMs 5000 -ScriptBlock {
+        if ($Retry -and (Test-Path -LiteralPath $logPath -PathType Leaf)) {
+            $reader = [IO.StreamReader]::new($logPath, [Text.Encoding]::UTF8)
+            try {
+                while ($null -ne ($line = $reader.ReadLine())) {
+                    if ($line -eq $completionMarker) { return }
+                }
+            }
+            finally { $reader.Dispose() }
+        }
         $stream = [IO.FileStream]::new($logPath, [IO.FileMode]::Append, [IO.FileAccess]::Write, [IO.FileShare]::Read)
+        $initialLength = $stream.Length
         try {
-            $writer = [IO.StreamWriter]::new($stream, $Utf8NoBom)
+            $writer = [IO.StreamWriter]::new($stream, $Utf8NoBom, 1024, $true)
             try {
                 $writer.Write($block)
                 $writer.Flush()
                 $stream.Flush($true)
             }
             finally { $writer.Dispose() }
+        }
+        catch {
+            # Roll back a partial append so a later retry writes one full block.
+            try { $stream.SetLength($initialLength) } catch { }
+            throw
         }
         finally { $stream.Dispose() }
     }
@@ -4506,17 +4495,23 @@ function Write-DailyLog {
 try {
     switch ($Event) {
         'UserPromptSubmit' {
-            $state = Invoke-WithMutex -Name $runMutexName -TimeoutMs 5000 -ScriptBlock {
+            $preparedState = $null
+            if ($null -eq (Read-JsonFile -Path $statePath)) {
+                $preparedState = New-RunState -StartedAt $eventReceivedAt -StartMonotonicTicks ([Diagnostics.Stopwatch]::GetTimestamp()) -StartSource 'UserPromptSubmit'
+            }
+            $preparedAtMs = $eventWatch.ElapsedMilliseconds
+            $skills = @(Get-ExplicitSkillNames -PromptValue (Get-PropertyValue -Object $Payload -Name 'prompt' -Default ''))
+            $structuredSkills = @(Get-StructuredSkillNames -Value $Payload -Strict)
+            $state = Invoke-WithMutex -Name $runMutexName -TimeoutMs 1000 -ScriptBlock {
                 $existing = Read-JsonFile -Path $statePath
                 if ($null -eq $existing) {
-                    $now = [DateTimeOffset]::Now
-                    $newState = New-RunState -StartedAt $now -StartMonotonicTicks ([Diagnostics.Stopwatch]::GetTimestamp()) -StartSource 'UserPromptSubmit'
-                    Write-Utf8FileAtomic -Path $statePath -Content ($newState | ConvertTo-Json -Compress -Depth 10)
-                    return Read-JsonFile -Path $statePath
+                    $existing = [pscustomobject]$preparedState
                 }
-
-                $skills = @(Get-ExplicitSkillNames -PromptValue (Get-PropertyValue -Object $Payload -Name 'prompt' -Default ''))
-                $structuredSkills = @(Get-StructuredSkillNames -Value $Payload -Strict)
+                # Count only prompts in this turn, atomically with the existing baseline.
+                # A separate name prevents importing the old session-wide inputCount.
+                Set-PropertyValue -Object $existing -Name 'promptCount' -Value (1 + [int](Get-PropertyValue -Object $existing -Name 'promptCount' -Default 0))
+                Set-PropertyValue -Object $existing -Name 'promptPreparationMs' -Value $preparedAtMs
+                Set-PropertyValue -Object $existing -Name 'promptLockWaitMs' -Value ($eventWatch.ElapsedMilliseconds - $preparedAtMs)
                 $existing = Merge-SkillNamesIntoState -State $existing -PropertyName 'explicitSkills' -SkillNames $skills
                 $existing = Merge-SkillNamesIntoState -State $existing -PropertyName 'structuredSkills' -SkillNames $structuredSkills
                 if ([string]::IsNullOrWhiteSpace([string](Get-PropertyValue -Object $existing -Name 'transcriptIdentityHash' -Default ''))) {
@@ -4532,12 +4527,9 @@ try {
                 return Read-JsonFile -Path $statePath
             }
 
-            $startTime = [DateTimeOffset]::Now
-            try {
-                $startTime = [DateTimeOffset]::Parse([string]$state.startedAt, [Globalization.CultureInfo]::InvariantCulture)
-            }
-            catch { }
-            Write-HookJsonOutput -SystemMessage ('开始 ' + $startTime.ToLocalTime().ToString('HH:mm:ss'))
+            Write-DebugRecord -Message ('输入处理阶段用时毫秒：准备=' + $preparedAtMs + '；加锁及写入=' + ($eventWatch.ElapsedMilliseconds - $preparedAtMs))
+            $inputMessage = if ([int]$state.promptCount -eq 1) { '开始 ' } else { '第 ' + $state.promptCount + ' 次输入 ' }
+            Write-HookJsonOutput -SystemMessage ($inputMessage + $eventReceivedAt.ToLocalTime().ToString('HH:mm:ss'))
             exit 0
         }
 
@@ -4545,7 +4537,10 @@ try {
             $existingCompleted = $null
             try { $existingCompleted = Read-JsonFile -Path $completedPath } catch { }
             if ($null -ne $existingCompleted) {
-                Write-HookJsonOutput -SystemMessage ([string](Get-PropertyValue -Object $existingCompleted -Name 'summary' -Default ''))
+                $result = Invoke-WithMutex -Name $runMutexName -TimeoutMs 10000 -ScriptBlock {
+                    Complete-PendingSummary -Completed (Read-JsonFile -Path $completedPath) -Retry
+                }
+                Write-HookJsonOutput -SystemMessage ([string]$result.Summary)
                 exit 0
             }
 
@@ -4554,34 +4549,21 @@ try {
             $stateForSkillObservation = $null
             try { $stateForSkillObservation = Read-JsonFile -Path $statePath } catch { }
             $mainSkillObservation = Get-MainTranscriptSkillObservation -State $stateForSkillObservation -StopPayload $Payload
-            $baselineAddedPathIds = [System.Collections.Generic.List[string]]::new()
-            $workspaceBaselineForEnd = Get-PropertyValue -Object $stateForSkillObservation -Name 'workspaceBaseline' -Default $null
-            foreach ($entry in @((Get-PropertyValue -Object $workspaceBaselineForEnd -Name 'entries' -Default @()))) {
-                if ([string]::Equals([string](Get-PropertyValue -Object $entry -Name 'kind' -Default ''), 'added', [StringComparison]::Ordinal)) {
-                    $pathId = [string](Get-PropertyValue -Object $entry -Name 'pathId' -Default '')
-                    if (-not [string]::IsNullOrWhiteSpace($pathId)) { $baselineAddedPathIds.Add($pathId) }
-                }
-            }
-            $endWorkspaceSnapshot = Get-GitWorkspaceSnapshot `
-                -Cwd ([string](Get-PropertyValue -Object $Payload -Name 'cwd' -Default '')) `
-                -TrackedPathIdsToFind @($baselineAddedPathIds)
+            $activityObservation = Get-MainTranscriptActivityObservation -State $stateForSkillObservation -StopPayload $Payload
 
             $summaryObject = Invoke-WithMutex -Name $runMutexName -TimeoutMs 10000 -ScriptBlock {
                 $done = $null
                 try { $done = Read-JsonFile -Path $completedPath } catch { }
                 if ($null -ne $done) {
-                    return [PSCustomObject]@{
-                        Summary = [string](Get-PropertyValue -Object $done -Name 'summary' -Default '')
-                        AlreadyCompleted = $true
-                    }
+                    return Complete-PendingSummary -Completed $done -Retry
                 }
 
                 $state = Ensure-RunState -Source 'inferred-from-stop'
                 $events = Read-JournalEvents
+                $events = @($events) + @($activityObservation.Events)
                 # v1.7+：SubagentStart/child tool events use a child turn_id. The original
                 # run key split them into orphan journals, so merge only same-session
                 # child journals whose SubagentStart falls inside this root task window.
-                Start-Sleep -Milliseconds 120
                 $v17RelatedSubagentData = Get-V17RelatedSubagentJournalData `
                     -JournalDirectory ([System.IO.Path]::GetDirectoryName($journalPath)) `
                     -StateDirectory ([System.IO.Path]::GetDirectoryName($statePath)) `
@@ -4598,22 +4580,11 @@ try {
                 # a successful Collaboration spawn has explicit success evidence.
                 $events = Add-V17SpawnFallbackSubagentEvents -Events @($events)
 
-                $endedAt = [DateTimeOffset]::Now
+                $endedAt = $eventReceivedAt
                 $endTicks = [Diagnostics.Stopwatch]::GetTimestamp()
-                $built = Build-Summary -State $state -Events $events -EndedAt $endedAt -EndMonotonicTicks $endTicks -StopPayload $Payload -EndWorkspaceSnapshot $endWorkspaceSnapshot -MainSkillObservation $mainSkillObservation
+                $activityObservation = Add-ChildFileActivity -Observation $activityObservation -Events $events -State $state -StopPayload $Payload -EndedAt $endedAt
+                $built = Build-Summary -State $state -Events $events -EndedAt $endedAt -EndMonotonicTicks $endTicks -StopPayload $Payload -MainSkillObservation $mainSkillObservation -ActivityObservation $activityObservation
 
-                $logPath = $null
-                try {
-                    $logPath = Write-DailyLog -SummaryObject $built
-                }
-                catch {
-                    Write-DebugRecord -Message '每日日志写入失败。' -ExceptionObject $_.Exception
-                }
-
-                $logFileName = $null
-                if (-not [string]::IsNullOrWhiteSpace([string]$logPath)) {
-                    $logFileName = [IO.Path]::GetFileName([string]$logPath)
-                }
                 $completed = [ordered]@{
                     schemaVersion = 11
                     programVersion = $ProgramVersion
@@ -4623,16 +4594,17 @@ try {
                     status = $built.Status
                     statusSource = $built.StatusSource
                     summary = $built.Summary
-                    logFileName = $logFileName
+                    logPending = $true
+                    pendingSummary = $built
+                    mergedRunHashes = @($v17RelatedSubagentData.RunHashes)
                 }
-                Write-Utf8FileAtomic -Path $completedPath -Content ($completed | ConvertTo-Json -Compress -Depth 10)
-
-                Remove-Item -LiteralPath $statePath -Force -ErrorAction SilentlyContinue
-                Remove-V17MergedSubagentArtifacts -MergeData $v17RelatedSubagentData
-                Remove-Item -LiteralPath $journalPath -Force -ErrorAction SilentlyContinue
-
-                $built | Add-Member -NotePropertyName AlreadyCompleted -NotePropertyValue $false
-                return $built
+                # PS5.1 otherwise serializes DateTimeOffset as /Date(...)/ and
+                # loses the original offset on ConvertFrom-Json during recovery.
+                Set-PropertyValue -Object $built -Name 'StartedAt' -Value ($built.StartedAt.ToString('o'))
+                Set-PropertyValue -Object $built -Name 'EndedAt' -Value ($built.EndedAt.ToString('o'))
+                # Freeze the final snapshot before attempting the fallible log write.
+                Write-Utf8FileAtomic -Path $completedPath -Content ($completed | ConvertTo-Json -Compress -Depth 15)
+                return Complete-PendingSummary -Completed (Read-JsonFile -Path $completedPath)
             }
 
             Write-HookJsonOutput -SystemMessage ([string]$summaryObject.Summary)
@@ -4652,7 +4624,7 @@ catch {
     Write-DebugRecord -Message 'Hook 出现未处理异常，Codex 任务已继续执行。' -ExceptionObject $_.Exception
 
     if ($Event -eq 'UserPromptSubmit') {
-        Write-HookJsonOutput -SystemMessage ('开始 ' + [DateTimeOffset]::Now.ToLocalTime().ToString('HH:mm:ss'))
+        Write-HookJsonOutput -SystemMessage ('输入 ' + $eventReceivedAt.ToLocalTime().ToString('HH:mm:ss') + '（统计初始化未完成）')
     }
     elseif ($Event -eq 'Stop') {
         Write-HookJsonOutput -SystemMessage '任务统计生成失败，已跳过；Codex 任务不受影响。'

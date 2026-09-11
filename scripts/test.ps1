@@ -69,6 +69,15 @@ if ($subagentCorrelationTestText.IndexOf('子Agent关联与 PowerShell 5.1 兼�
 }
 Write-Host $subagentCorrelationTestText
 
+& powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $ProjectRoot 'tests\net-statistics.tests.ps1')
+if ($LASTEXITCODE -ne 0) { throw '最终差异与日志恢复回归测试失败。' }
+& powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $ProjectRoot 'tests\file-change-records.tests.ps1')
+if ($LASTEXITCODE -ne 0) { throw 'FileChange 文件统计回归失败。' }
+& powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $ProjectRoot 'tests\mcp-transcript.tests.ps1')
+if ($LASTEXITCODE -ne 0) { throw 'MCP 会话补采回归失败。' }
+& powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $ProjectRoot 'tests\subagent-transcript.tests.ps1')
+if ($LASTEXITCODE -ne 0) { throw '子 Agent 会话补采回归失败。' }
+
 # v2.1 static release guards for the three target-runtime regressions.
 $mainSourceForStaticChecks = [IO.File]::ReadAllText($MainScript, [Text.Encoding]::UTF8)
 if ($mainSourceForStaticChecks -match '\.IndexOf\(\$Flag\)') {
@@ -80,13 +89,23 @@ if ($mainSourceForStaticChecks -notmatch 'ToCharArray\(\)') {
 $testSourceForStaticChecks = [IO.File]::ReadAllText($MyInvocation.MyCommand.Path, [Text.Encoding]::UTF8)
 if ($testSourceForStaticChecks -match '\[Nullable\[double\]\]\$DurationMilliseconds' -or
     $testSourceForStaticChecks -match '\$DurationMilliseconds\.Value') {
-    throw '测试耗时参数不得依赖 Nullable[double].Value。'
+    throw '测试用时参数不得依赖 Nullable[double].Value。'
 }
 if ([Regex]::IsMatch(
     $testSourceForStaticChecks,
     'Assert-Contains\s+-Text\s+\$journalText\s+-Expected\s+''<'
 )) {
     throw 'Journal 占位符测试必须解析 JSONL 后验证语义，不得断言原始转义文本。'
+}
+
+function Add-TestFileChangeRecord {
+    param([string]$Turn,[string]$Id,[hashtable]$Changes)
+    $record=@{type='event_msg';payload=@{type='item_completed';turn_id=$Turn;item=@{type='FileChange';status='completed';id=$Id;changes=$Changes}}}
+    [IO.File]::AppendAllText($MainTranscript,($record|ConvertTo-Json -Depth 12 -Compress)+"`n",$Utf8NoBom)
+}
+function Test-OneLineDiff {
+    param([string]$Before,[string]$After)
+    return "@@ -1 +1 @@`n-"+$Before+"`n\ No newline at end of file`n+"+$After+"`n\ No newline at end of file`n"
 }
 
 function Invoke-TestHook {
@@ -394,7 +413,7 @@ try {
     # Main successful turn: actual transcript injection, structured Skill input,
     # explicit $skill fallback, subagent transcripts, MCP, file operations, and
     # other tools. The workspace is deliberately not a Git repository here, so
-    # this block validates the privacy-safe apply_patch parser by itself.
+    # this block validates parser evidence against actual final file contents.
     $availableOnlyRecord = [ordered]@{
         type = 'context'
         skills = @(
@@ -407,6 +426,9 @@ try {
     } | ConvertTo-Json -Compress -Depth 10
     [IO.File]::WriteAllText($MainTranscript, $availableOnlyRecord + [Environment]::NewLine, $Utf8NoBom)
 
+    foreach ($name in @('FILE_MODIFIED_SECRET.txt', 'FILE_RENAME_SOURCE_SECRET.txt', 'FILE_DELETED_SECRET.txt')) {
+        [IO.File]::WriteAllText((Join-Path $WorkspaceRoot $name), ('old-' + $name), $Utf8NoBom)
+    }
     $startRaw = Invoke-TestHook -Event 'UserPromptSubmit' -Fields @{
         prompt = 'PROMPT_SECRET_SHOULD_NOT_BE_STORED $analyze $pdfs $pdfs @plain-person'
         input_items = @(
@@ -664,6 +686,19 @@ Move-Item -LiteralPath $old -Destination $new
     Assert-Contains -Text $journalSafeCommandText -Expected '<远程地址已隐藏>'
     Assert-Contains -Text $journalSafeCommandText -Expected '<内容已隐藏>'
 
+    foreach ($name in @('FILE_ADDED_SECRET.txt', 'FILE_MODIFIED_RENAMED_SECRET.txt', 'FILE_RENAME_TARGET_SECRET.txt')) {
+        [IO.File]::WriteAllText((Join-Path $WorkspaceRoot $name), ('new-' + $name), $Utf8NoBom)
+    }
+    foreach ($name in @('FILE_MODIFIED_SECRET.txt', 'FILE_RENAME_SOURCE_SECRET.txt', 'FILE_DELETED_SECRET.txt')) {
+        Remove-Item -LiteralPath (Join-Path $WorkspaceRoot $name)
+    }
+    Add-TestFileChangeRecord 'turn_test_001' 'patch-1' @{
+        'FILE_ADDED_SECRET.txt'=@{type='add';content='new-FILE_ADDED_SECRET.txt'}
+        'FILE_MODIFIED_SECRET.txt'=@{type='update';move_path='FILE_MODIFIED_RENAMED_SECRET.txt';unified_diff=(Test-OneLineDiff 'old-FILE_MODIFIED_SECRET.txt' 'new-FILE_MODIFIED_RENAMED_SECRET.txt')}
+        'FILE_RENAME_SOURCE_SECRET.txt'=@{type='update';move_path='FILE_RENAME_TARGET_SECRET.txt';unified_diff=(Test-OneLineDiff 'old-FILE_RENAME_SOURCE_SECRET.txt' 'new-FILE_RENAME_TARGET_SECRET.txt')}
+        'FILE_DELETED_SECRET.txt'=@{type='delete';content='old-FILE_DELETED_SECRET.txt'}
+    }
+    Add-TestFileChangeRecord 'turn_test_001' 'patch-2' @{'FILE_MODIFIED_RENAMED_SECRET.txt'=@{type='update';unified_diff=''}}
     $stopRaw = Invoke-TestHook -Event 'Stop' -DurationMilliseconds 3700 -Fields @{ stop_hook_active = $false; last_assistant_message = 'ASSISTANT_SECRET_SHOULD_NOT_BE_STORED' }
     $stop = $stopRaw | ConvertFrom-Json
     $message = [string]$stop.systemMessage
@@ -677,7 +712,7 @@ Move-Item -LiteralPath $old -Destination $new
         throw "Stop 生成的 completed schemaVersion 不是 11：$($completedRecord.schemaVersion)"
     }
 
-    Assert-Contains -Text $message -Expected '耗时 4秒'
+    Assert-Contains -Text $message -Expected '用时 4秒'
     Assert-NotContains -Text $message -Unexpected '状态：完成'
     Assert-Contains -Text $message -Expected '🔌 MCP：filesystem/read_file ×3，browser/open ×1'
     Assert-Contains -Text $message -Expected '🧩 Skill：analyze ×1，openai-docs ×1，custom-call-skill ×1，slides ×1，runtime-helper ×1，agent-skill ×2，agent-command-skill ×2，pdfs ×1'
@@ -689,7 +724,7 @@ Move-Item -LiteralPath $old -Destination $new
     Assert-NotContains -Text $message -Unexpected 'patch-mentioned-skill'
     Assert-NotContains -Text $message -Unexpected 'pending-call-skill'
     Assert-Contains -Text $message -Expected '🤖 子Agent：researcher ×2'
-    Assert-Contains -Text $message -Expected '📝 文件：新增 ×1，修改 ×2，删除 ×1'
+    Assert-Contains -Text $message -Expected '📝 文件：新增 ×3，删除 ×3'
     Assert-Contains -Text $message -Expected '🌿 Git：运行 ×2，指令 ×6，变更 ×3'
     Assert-Contains -Text $message -Expected '⚙️ 其他：Shell命令 ×7，权限请求 ×1，上下文压缩 ×1'
     $gitPosition = $message.IndexOf('🌿 Git：', [StringComparison]::Ordinal)
@@ -729,11 +764,11 @@ Move-Item -LiteralPath $old -Destination $new
     Assert-Contains -Text $logText -Expected 'git commit -m <内容已隐藏>'
     Assert-Contains -Text $logText -Expected "Select-String -Path src/views/amazon/listing/products/index.vue -Pattern <内容已隐藏>"
     Assert-Contains -Text $logText -Expected '命令记录策略：safe（仅保存安全处理后的内容，原始命令不落盘）'
-    Assert-Matches -Text $logText -Pattern '(?s)文件：\s*\r?\n\s*- 新增 ×1\s*\r?\n\s*- 修改 ×2\s*\r?\n\s*- 删除 ×1'
-    Assert-Contains -Text $logText -Expected '文件变更总数：4'
+    Assert-Matches -Text $logText -Pattern '(?s)文件：\s*\r?\n\s*- 新增 ×3\s*\r?\n\s*- 删除 ×3'
+    Assert-Contains -Text $logText -Expected '文件变更总数：6'
     Assert-Contains -Text $logText -Expected '编辑操作次数：2'
     Assert-Contains -Text $logText -Expected '未解析编辑操作：0'
-    Assert-Contains -Text $logText -Expected '文件采集来源：apply_patch + 命令重命名/移动'
+    Assert-Contains -Text $logText -Expected '文件采集来源：成功 FileChange 记录与涉及文件内容核验'
     Assert-Contains -Text $logText -Expected '文件统计完整性：部分'
     Assert-Matches -Text $logText -Pattern '(?s)其他：\s*\r?\n\s*- Shell命令 ×7\s*\r?\n\s*- 权限请求 ×1\s*\r?\n\s*- 上下文压缩 ×1'
     Assert-Contains -Text $logText -Expected '采集模式：多源识别'
@@ -842,8 +877,9 @@ Move-Item -LiteralPath $old -Destination $new
     $runtimeConfig.commandLogging.mode = 'safe'
     [IO.File]::WriteAllText($runtimeConfigPath, ($runtimeConfig | ConvertTo-Json -Depth 50), $Utf8NoBom)
 
-    # 仅重命名/移动也必须归入“文件：修改 ×1”，且不能同时计入新增或删除。
+    # 移动按原路径删除与新路径新增分别归类。
     $moveOnlyTurn = 'turn_move_only'
+    [IO.File]::WriteAllText((Join-Path $WorkspaceRoot 'A.md'), 'move-only', $Utf8NoBom)
     $null = Invoke-TestHook -Event 'UserPromptSubmit' -Fields @{ turn_id = $moveOnlyTurn; prompt = 'move only test' }
     $moveOnlyCommand = @'
 $old='A.md'
@@ -851,22 +887,26 @@ $new='B.md'
 Move-Item -LiteralPath $old -Destination $new
 '@
     $null = Invoke-TestHook -Event 'PreToolUse' -Fields @{ turn_id = $moveOnlyTurn; tool_name = 'Bash'; tool_use_id = 'move-only'; tool_input = @{ command = $moveOnlyCommand } }
+    Move-Item -LiteralPath (Join-Path $WorkspaceRoot 'A.md') -Destination (Join-Path $WorkspaceRoot 'B.md')
     $null = Invoke-TestHook -Event 'PostToolUse' -Fields @{ turn_id = $moveOnlyTurn; tool_name = 'Bash'; tool_use_id = 'move-only'; tool_input = @{ command = $moveOnlyCommand }; tool_response = @{} }
+    Add-TestFileChangeRecord $moveOnlyTurn 'native-move' @{'A.md'=@{type='update';move_path='B.md';unified_diff=''}}
     $moveOnlyStop = Invoke-TestHook -Event 'Stop' -DurationMilliseconds 1000 -Fields @{ turn_id = $moveOnlyTurn; stop_hook_active = $false }
     $moveOnlyMessage = [string](($moveOnlyStop | ConvertFrom-Json).systemMessage)
-    Assert-Contains -Text $moveOnlyMessage -Expected '📝 文件：修改 ×1'
-    Assert-NotContains -Text $moveOnlyMessage -Unexpected '文件：新增'
-    Assert-NotContains -Text $moveOnlyMessage -Unexpected '文件：删除'
+    Assert-Contains -Text $moveOnlyMessage -Expected '📝 文件：新增 ×1，删除 ×1'
 
     # Rename-Item 使用相对 NewName 时，新路径应落在旧文件同一目录。
     $renameOnlyTurn = 'turn_rename_only'
+    $null = New-Item -ItemType Directory -Path (Join-Path $WorkspaceRoot 'folder') -Force
+    [IO.File]::WriteAllText((Join-Path $WorkspaceRoot 'folder\A.md'), 'rename-only', $Utf8NoBom)
     $null = Invoke-TestHook -Event 'UserPromptSubmit' -Fields @{ turn_id = $renameOnlyTurn; prompt = 'rename only test' }
     $renameOnlyCommand = "Rename-Item -LiteralPath 'folder\A.md' -NewName 'B.md'"
     $null = Invoke-TestHook -Event 'PreToolUse' -Fields @{ turn_id = $renameOnlyTurn; tool_name = 'Bash'; tool_use_id = 'rename-only'; tool_input = @{ command = $renameOnlyCommand } }
+    Rename-Item -LiteralPath (Join-Path $WorkspaceRoot 'folder\A.md') -NewName 'B.md'
     $null = Invoke-TestHook -Event 'PostToolUse' -Fields @{ turn_id = $renameOnlyTurn; tool_name = 'Bash'; tool_use_id = 'rename-only'; tool_input = @{ command = $renameOnlyCommand }; tool_response = @{} }
+    Add-TestFileChangeRecord $renameOnlyTurn 'native-rename' @{'folder\A.md'=@{type='update';move_path='folder\B.md';unified_diff=''}}
     $renameOnlyStop = Invoke-TestHook -Event 'Stop' -DurationMilliseconds 1000 -Fields @{ turn_id = $renameOnlyTurn; stop_hook_active = $false }
     $renameOnlyMessage = [string](($renameOnlyStop | ConvertFrom-Json).systemMessage)
-    Assert-Contains -Text $renameOnlyMessage -Expected '📝 文件：修改 ×1'
+    Assert-Contains -Text $renameOnlyMessage -Expected '📝 文件：新增 ×1，删除 ×1'
 
     # Git 参数敏感判断：只读命令不计变更，真正产生变化的命令逐条 +1。
     $gitClassificationTurn = 'turn_git_change_classification'
@@ -1008,7 +1048,7 @@ git push
     $null = Invoke-TestHook -Event 'UserPromptSubmit' -Fields @{ turn_id = $emptyTurn; prompt = 'NO_SKILL_SECRET_SHOULD_NOT_BE_STORED' }
     $emptyStopRaw = Invoke-TestHook -Event 'Stop' -DurationMilliseconds 400 -Fields @{ turn_id = $emptyTurn; stop_hook_active = $false }
     $emptyMessage = [string](($emptyStopRaw | ConvertFrom-Json).systemMessage)
-    Assert-Matches -Text $emptyMessage -Pattern '^结束 .+（耗时 不足1秒）$'
+    Assert-Matches -Text $emptyMessage -Pattern '^结束 .+（用时 不足1秒）$'
     Assert-NotContains -Text $emptyMessage -Unexpected '状态：完成'
     foreach ($category in @('MCP：', 'Skill：', '子Agent：', '文件：', '其他：')) {
         Assert-NotContains -Text $emptyMessage -Unexpected $category
@@ -1024,7 +1064,7 @@ git push
     $null = Invoke-TestHook -Event 'UserPromptSubmit' -Fields @{ turn_id = $failedTurn; prompt = 'FAILED_TURN_SECRET_SHOULD_NOT_BE_STORED' }
     $failedStopRaw = Invoke-TestHook -Event 'Stop' -DurationMilliseconds 1500 -Fields @{ turn_id = $failedTurn; stop_hook_active = $false; status = 'failed' }
     $failedMessage = [string](($failedStopRaw | ConvertFrom-Json).systemMessage)
-    Assert-Contains -Text $failedMessage -Expected '耗时 2秒'
+    Assert-Contains -Text $failedMessage -Expected '用时 2秒'
     Assert-Contains -Text $failedMessage -Expected '状态：失败'
     Assert-NotContains -Text $failedMessage -Unexpected 'MCP：'
 
@@ -1032,19 +1072,17 @@ git push
     $null = Invoke-TestHook -Event 'UserPromptSubmit' -Fields @{ turn_id = $interruptedTurn; prompt = 'INTERRUPTED_TURN_SECRET_SHOULD_NOT_BE_STORED' }
     $interruptedStopRaw = Invoke-TestHook -Event 'Stop' -DurationMilliseconds 500 -Fields @{ turn_id = $interruptedTurn; stop_hook_active = $false; status = 'interrupted' }
     $interruptedMessage = [string](($interruptedStopRaw | ConvertFrom-Json).systemMessage)
-    Assert-Contains -Text $interruptedMessage -Expected '耗时 1秒'
+    Assert-Contains -Text $interruptedMessage -Expected '用时 1秒'
     Assert-Contains -Text $interruptedMessage -Expected '状态：已中断'
 
     $unknownTurn = 'turn_test_unknown'
     $null = Invoke-TestHook -Event 'UserPromptSubmit' -Fields @{ turn_id = $unknownTurn; prompt = 'UNKNOWN_TURN_SECRET_SHOULD_NOT_BE_STORED' }
     $unknownStopRaw = Invoke-TestHook -Event 'Stop' -DurationMilliseconds 0 -Fields @{ turn_id = $unknownTurn; stop_hook_active = $false; status = 'unknown' }
     $unknownMessage = [string](($unknownStopRaw | ConvertFrom-Json).systemMessage)
-    Assert-Contains -Text $unknownMessage -Expected '耗时 不足1秒'
+    Assert-Contains -Text $unknownMessage -Expected '用时 不足1秒'
     Assert-Contains -Text $unknownMessage -Expected '状态：未知'
 
-    # Optional Git integration verifies Shell/external file changes and the
-    # critical rename rule: one rename contributes exactly one 修改, while its
-    # source and destination do not also contribute to 新增/删除.
+    # Git state changes alone do not count; native records provide file evidence.
     $gitCommand = Get-Command git.exe -ErrorAction SilentlyContinue
     if ($null -eq $gitCommand) { $gitCommand = Get-Command git -ErrorAction SilentlyContinue }
     if ($null -ne $gitCommand) {
@@ -1082,11 +1120,15 @@ git push
         & $gitExe -C $gitWorkspace mv -- 'rename-source.txt' 'rename-target.txt'
         if ($LASTEXITCODE -ne 0) { throw 'Git 重命名测试准备失败。' }
 
+        Add-TestFileChangeRecord $gitTurn 'native-git-files' @{
+            'tracked.txt'=@{type='update';unified_diff=(Test-OneLineDiff 'original' 'modified')}
+            'added.txt'=@{type='add';content='added'}
+            'delete-me.txt'=@{type='delete';content='delete'}
+            'rename-source.txt'=@{type='update';move_path='rename-target.txt';unified_diff=''}
+        }
         $gitStopRaw = Invoke-TestHook -Event 'Stop' -DurationMilliseconds 2100 -Fields @{ turn_id = $gitTurn; cwd = $gitWorkspace; stop_hook_active = $false }
         $gitMessage = [string](($gitStopRaw | ConvertFrom-Json).systemMessage)
-        Assert-Contains -Text $gitMessage -Expected '📝 文件：新增 ×1，修改 ×2，删除 ×1'
-        Assert-NotContains -Text $gitMessage -Unexpected '新增 ×2'
-        Assert-NotContains -Text $gitMessage -Unexpected '删除 ×2'
+        Assert-Contains -Text $gitMessage -Expected '📝 文件：新增 ×2，修改 ×1，删除 ×2'
     }
     else {
         Write-Warning '未找到 Git，已跳过可选的 Git 差异集成测试。'
@@ -1937,6 +1979,8 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 
+    & powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $ProjectRoot 'tests\runtime-recovery.tests.ps1')
+    if ($LASTEXITCODE -ne 0) { throw '运行时恢复回归失败。' }
     Write-Host '所有测试均已通过。' -ForegroundColor Green
     Write-Host ''
     Write-Host '开始输出：'

@@ -35,18 +35,24 @@ If it makes long-running Codex work easier to understand, review, and debug, con
 Task start:
 
 ```text
-开始 14:07:08
+🟢 开始：14:07:08
 ```
 
 Task completion:
 
 ```text
-结束 14:08:34（用时 1分26秒）｜🔌 MCP：mysql_7/query ×2｜🧩 Skill：analyze ×1｜🤖 子Agent：code_reviewer ×1，architect ×1｜📝 文件：修改 ×3｜🌿 Git：运行 ×2，指令 ×6，变更 ×1｜⚙️ 其他：Shell命令 ×2
+🔴 结束：14:08:34（用时：1分26秒）
+🔌 MCP：mysql_7/query ×2
+🧩 Skill：analyze ×1
+🤖 子Agent：code_reviewer ×1，architect ×1
+📝 文件：修改 ×3
+🌿 Git：运行 ×2，指令 ×6，变更 ×1
+⚙️ 其他：Shell命令 ×2
 ```
 
 Empty categories are hidden automatically. Successful tasks do not show a redundant “completed” status; failure, interruption, or unknown states are displayed explicitly.
 
-The client may wrap the card depending on available width. By default, Codex Task Stats emits one logical line separated with `｜`. Setting `display.multiline` to `true` inserts real line breaks between categories, but their visual presentation depends on the client. See [Hook display and newline diagnostics (Chinese)](HOOK_DISPLAY.md) for configuration semantics, verification results, and troubleshooting.
+The client may wrap the card depending on available width. By default, Codex Task Stats enables `display.multiline` and inserts real line breaks between categories. Setting it to `false` restores one logical line separated with `｜`. How line breaks appear depends on the client. See [Hook display and newline diagnostics (Chinese)](HOOK_DISPLAY.md) for configuration semantics, verification results, and troubleshooting.
 
 ## Where the Hooks appear
 

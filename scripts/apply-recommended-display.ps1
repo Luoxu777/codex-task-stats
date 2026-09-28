@@ -107,7 +107,7 @@ if ($null -eq $config -or $config -isnot [PSCustomObject]) {
 $changed = $false
 if (Ensure-ObjectProperty -Object $config -Name 'display') { $changed = $true }
 if (Set-RecommendedValue -Object $config -Name 'schemaVersion' -Value 11) { $changed = $true }
-if (Set-RecommendedValue -Object $config.display -Name 'multiline' -Value $false) { $changed = $true }
+if (Set-RecommendedValue -Object $config.display -Name 'multiline' -Value $true) { $changed = $true }
 if (Set-RecommendedValue -Object $config.display -Name 'showCoverageNotice' -Value $false) { $changed = $true }
 if (Set-RecommendedValue -Object $config.display -Name 'showSuccessStatus' -Value $false) { $changed = $true }
 if (Set-RecommendedValue -Object $config.display -Name 'hideEmptyCategories' -Value $true) { $changed = $true }

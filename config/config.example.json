@@ -1,7 +1,7 @@
 {
   "schemaVersion": 11,
   "display": {
-    "multiline": false,
+    "multiline": true,
     "showCoverageNotice": false,
     "showSuccessStatus": false,
     "hideEmptyCategories": true,

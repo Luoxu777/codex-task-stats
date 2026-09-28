@@ -37,18 +37,24 @@ Codex Task Stats 通过用户级 Hook 自动收集这些信息：客户端只显
 任务开始：
 
 ```text
-开始 14:07:08
+🟢 开始：14:07:08
 ```
 
 任务结束：
 
 ```text
-结束 14:08:34（用时 1分26秒）｜🔌 MCP：mysql_7/query ×2｜🧩 Skill：analyze ×1｜🤖 子Agent：code_reviewer ×1，architect ×1｜📝 文件：修改 ×3｜🌿 Git：运行 ×2，指令 ×6，变更 ×1｜⚙️ 其他：Shell命令 ×2
+🔴 结束：14:08:34（用时：1分26秒）
+🔌 MCP：mysql_7/query ×2
+🧩 Skill：analyze ×1
+🤖 子Agent：code_reviewer ×1，architect ×1
+📝 文件：修改 ×3
+🌿 Git：运行 ×2，指令 ×6，变更 ×1
+⚙️ 其他：Shell命令 ×2
 ```
 
 没有数据的分类会自动隐藏。成功任务默认不显示“状态：完成”；失败、已中断或未知状态才会额外显示状态。
 
-客户端可能因为卡片宽度自动折行，程序默认生成以 `｜` 分隔的逻辑单行摘要。`display.multiline: true` 可以让脚本按分类输出真实换行，但是否按换行显示取决于客户端。配置含义、验证结果和排查方法见 [Hook 展示与换行排查](HOOK_DISPLAY.md)。
+程序默认启用 `display.multiline: true`，按分类输出真实换行；设为 `false` 可恢复以 `｜` 分隔的单行摘要。实际显示效果取决于客户端。配置含义、验证结果和排查方法见 [Hook 展示与换行排查](HOOK_DISPLAY.md)。
 
 ## Hook 在哪里显示
 

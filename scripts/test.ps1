@@ -362,7 +362,7 @@ try {
     $env:CODEX_TASK_STATS_HOME = $sampleReplayRoot
     try {
         $sampleStartRaw = Invoke-TestHookSample -Name 'user-prompt-submit.json'
-        Assert-Contains -Text ([string](($sampleStartRaw | ConvertFrom-Json).systemMessage)) -Expected '开始 '
+        Assert-Contains -Text ([string](($sampleStartRaw | ConvertFrom-Json).systemMessage)) -Expected '🟢 开始：'
         $null = Invoke-TestHookSample -Name 'post-tool-use-apply-patch.json'
         $null = Invoke-TestHookSample -Name 'post-tool-use-mcp.json'
         $null = Invoke-TestHookSample -Name 'subagent-start.json'
@@ -440,7 +440,7 @@ try {
         )
     }
     $start = $startRaw | ConvertFrom-Json
-    Assert-Contains -Text ([string]$start.systemMessage) -Expected '开始 '
+    Assert-Contains -Text ([string]$start.systemMessage) -Expected '🟢 开始：'
 
     $initialStateFile = Get-ChildItem -LiteralPath (Join-Path $TestRoot 'data\state') -Filter '*.json' -File | Select-Object -First 1
     if ($null -eq $initialStateFile) {
@@ -712,7 +712,7 @@ Move-Item -LiteralPath $old -Destination $new
         throw "Stop 生成的 completed schemaVersion 不是 11：$($completedRecord.schemaVersion)"
     }
 
-    Assert-Contains -Text $message -Expected '用时 4秒'
+    Assert-Contains -Text $message -Expected '用时：4秒'
     Assert-NotContains -Text $message -Unexpected '状态：完成'
     Assert-Contains -Text $message -Expected '🔌 MCP：filesystem/read_file ×3，browser/open ×1'
     Assert-Contains -Text $message -Expected '🧩 Skill：analyze ×1，openai-docs ×1，custom-call-skill ×1，slides ×1，runtime-helper ×1，agent-skill ×2，agent-command-skill ×2，pdfs ×1'
@@ -733,8 +733,13 @@ Move-Item -LiteralPath $old -Destination $new
         throw '客户端摘要中的 Git 必须位于“其他”之前。'
     }
     Assert-NotContains -Text $message -Unexpected '文件修改'
-    if ($message.IndexOf("`r", [StringComparison]::Ordinal) -ge 0 -or $message.IndexOf("`n", [StringComparison]::Ordinal) -ge 0) {
-        throw '默认 Stop 输出必须是逻辑单行。'
+    $summaryLines = @($message -split "`n")
+    $expectedPrefixes = @('🔴 结束：', '🔌 MCP：', '🧩 Skill：', '🤖 子Agent：', '📝 文件：', '🌿 Git：', '⚙️ 其他：')
+    if ($summaryLines.Count -ne $expectedPrefixes.Count) { throw '默认 Stop 输出必须按分类换行。' }
+    for ($lineIndex = 0; $lineIndex -lt $expectedPrefixes.Count; $lineIndex++) {
+        if (-not $summaryLines[$lineIndex].StartsWith($expectedPrefixes[$lineIndex], [StringComparison]::Ordinal)) {
+            throw ('摘要行标签或顺序错误：' + $summaryLines[$lineIndex])
+        }
     }
     Assert-NotContains -Text $message -Unexpected '统计范围：'
 
@@ -1048,7 +1053,7 @@ git push
     $null = Invoke-TestHook -Event 'UserPromptSubmit' -Fields @{ turn_id = $emptyTurn; prompt = 'NO_SKILL_SECRET_SHOULD_NOT_BE_STORED' }
     $emptyStopRaw = Invoke-TestHook -Event 'Stop' -DurationMilliseconds 400 -Fields @{ turn_id = $emptyTurn; stop_hook_active = $false }
     $emptyMessage = [string](($emptyStopRaw | ConvertFrom-Json).systemMessage)
-    Assert-Matches -Text $emptyMessage -Pattern '^结束 .+（用时 不足1秒）$'
+    Assert-Matches -Text $emptyMessage -Pattern '^🔴 结束：.+（用时：不足1秒）$'
     Assert-NotContains -Text $emptyMessage -Unexpected '状态：完成'
     foreach ($category in @('MCP：', 'Skill：', '子Agent：', '文件：', '其他：')) {
         Assert-NotContains -Text $emptyMessage -Unexpected $category
@@ -1064,7 +1069,7 @@ git push
     $null = Invoke-TestHook -Event 'UserPromptSubmit' -Fields @{ turn_id = $failedTurn; prompt = 'FAILED_TURN_SECRET_SHOULD_NOT_BE_STORED' }
     $failedStopRaw = Invoke-TestHook -Event 'Stop' -DurationMilliseconds 1500 -Fields @{ turn_id = $failedTurn; stop_hook_active = $false; status = 'failed' }
     $failedMessage = [string](($failedStopRaw | ConvertFrom-Json).systemMessage)
-    Assert-Contains -Text $failedMessage -Expected '用时 2秒'
+    Assert-Contains -Text $failedMessage -Expected '用时：2秒'
     Assert-Contains -Text $failedMessage -Expected '状态：失败'
     Assert-NotContains -Text $failedMessage -Unexpected 'MCP：'
 
@@ -1072,14 +1077,14 @@ git push
     $null = Invoke-TestHook -Event 'UserPromptSubmit' -Fields @{ turn_id = $interruptedTurn; prompt = 'INTERRUPTED_TURN_SECRET_SHOULD_NOT_BE_STORED' }
     $interruptedStopRaw = Invoke-TestHook -Event 'Stop' -DurationMilliseconds 500 -Fields @{ turn_id = $interruptedTurn; stop_hook_active = $false; status = 'interrupted' }
     $interruptedMessage = [string](($interruptedStopRaw | ConvertFrom-Json).systemMessage)
-    Assert-Contains -Text $interruptedMessage -Expected '用时 1秒'
+    Assert-Contains -Text $interruptedMessage -Expected '用时：1秒'
     Assert-Contains -Text $interruptedMessage -Expected '状态：已中断'
 
     $unknownTurn = 'turn_test_unknown'
     $null = Invoke-TestHook -Event 'UserPromptSubmit' -Fields @{ turn_id = $unknownTurn; prompt = 'UNKNOWN_TURN_SECRET_SHOULD_NOT_BE_STORED' }
     $unknownStopRaw = Invoke-TestHook -Event 'Stop' -DurationMilliseconds 0 -Fields @{ turn_id = $unknownTurn; stop_hook_active = $false; status = 'unknown' }
     $unknownMessage = [string](($unknownStopRaw | ConvertFrom-Json).systemMessage)
-    Assert-Contains -Text $unknownMessage -Expected '用时 不足1秒'
+    Assert-Contains -Text $unknownMessage -Expected '用时：不足1秒'
     Assert-Contains -Text $unknownMessage -Expected '状态：未知'
 
     # Git state changes alone do not count; native records provide file evidence.
@@ -1594,10 +1599,10 @@ function Invoke-V19SubagentCorrelationCompatibilityProbe {
         $installedSmokeTurn = 'turn_installed_runtime_smoke'
         $installedStartRaw = Invoke-TestHook -Event 'UserPromptSubmit' -Fields @{ turn_id = $installedSmokeTurn; prompt = 'INSTALL_RUNTIME_SMOKE' }
         $installedStartMessage = [string](($installedStartRaw | ConvertFrom-Json).systemMessage)
-        Assert-Matches -Text $installedStartMessage -Pattern '^开始 [0-9]{2}:[0-9]{2}:[0-9]{2}$'
+        Assert-Matches -Text $installedStartMessage -Pattern '^🟢 开始：[0-9]{2}:[0-9]{2}:[0-9]{2}$'
         $installedStopRaw = Invoke-TestHook -Event 'Stop' -DurationMilliseconds 0 -Fields @{ turn_id = $installedSmokeTurn; stop_hook_active = $false; status = 'completed' }
         $installedStopMessage = [string](($installedStopRaw | ConvertFrom-Json).systemMessage)
-        Assert-Contains -Text $installedStopMessage -Expected '结束 '
+        Assert-Contains -Text $installedStopMessage -Expected '🔴 结束：'
         Assert-NotContains -Text $installedStopMessage -Unexpected '任务统计生成失败'
         $installedLog = Get-ChildItem -LiteralPath (Join-Path $fakeCodexHome 'task-stats\logs') -Filter '*.log' -File |
             Sort-Object LastWriteTime -Descending |
@@ -1654,7 +1659,7 @@ function Invoke-V19SubagentCorrelationCompatibilityProbe {
     # Verify the migration helper applies all v2.1 recommendations, creates a
     # backup, removes only the obsolete default alias, and preserves unrelated settings.
     $installedConfig = [IO.File]::ReadAllText($installedConfigPath, [Text.Encoding]::UTF8) | ConvertFrom-Json
-    $installedConfig.display.multiline = $true
+    $installedConfig.display.multiline = $false
     $installedConfig.display.showCoverageNotice = $true
     $installedConfig.display.showSuccessStatus = $true
     $installedConfig.display.hideEmptyCategories = $false
@@ -1674,7 +1679,7 @@ function Invoke-V19SubagentCorrelationCompatibilityProbe {
     }
     $updatedConfig = [IO.File]::ReadAllText($installedConfigPath, [Text.Encoding]::UTF8) | ConvertFrom-Json
     if ([int]$updatedConfig.schemaVersion -ne 11) { throw '推荐配置脚本未设置 schemaVersion 11。' }
-    if ([bool]$updatedConfig.display.multiline -ne $false) { throw '推荐配置脚本未关闭 multiline 输出。' }
+    if ([bool]$updatedConfig.display.multiline -ne $true) { throw '推荐配置脚本未开启 multiline 输出。' }
     if ([bool]$updatedConfig.display.showCoverageNotice -ne $false) { throw '推荐配置脚本未隐藏客户端统计范围说明。' }
     if ([bool]$updatedConfig.display.showSuccessStatus -ne $false) { throw '推荐配置脚本未隐藏成功状态。' }
     if ([bool]$updatedConfig.display.hideEmptyCategories -ne $true) { throw '推荐配置脚本未隐藏空分类。' }

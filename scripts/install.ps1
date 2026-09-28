@@ -369,7 +369,7 @@ function Invoke-RuntimeSmokeTest {
         $startText = @($startOutput) -join "`n"
         $startObject = $startText | ConvertFrom-Json
         $startMessage = [string]$startObject.systemMessage
-        if ($startMessage -notmatch '^开始 [0-9]{2}:[0-9]{2}:[0-9]{2}$') {
+        if ($startMessage -notmatch '^🟢 开始：[0-9]{2}:[0-9]{2}:[0-9]{2}$') {
             throw "$Label UserPromptSubmit 烟雾测试输出无效。"
         }
 
@@ -447,7 +447,7 @@ function Invoke-RuntimeSmokeTest {
         $stopText = @($stopOutput) -join "`n"
         $stopObject = $stopText | ConvertFrom-Json
         $stopMessage = [string]$stopObject.systemMessage
-        if ($stopMessage -match '任务统计生成失败' -or $stopMessage -notmatch '^结束 ') {
+        if ($stopMessage -match '任务统计生成失败' -or $stopMessage -notmatch '^🔴 结束：') {
             throw "$Label Stop 烟雾测试未生成正常摘要。"
         }
         if ($stopMessage.IndexOf('子Agent：default ×1', [StringComparison]::Ordinal) -lt 0) {

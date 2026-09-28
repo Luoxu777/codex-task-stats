@@ -84,7 +84,7 @@ trap {
     try {
         if ($Event -eq 'UserPromptSubmit') {
             $timeText = [DateTimeOffset]::Now.ToLocalTime().ToString('HH:mm:ss')
-            [Console]::Out.WriteLine('{"continue":true,"systemMessage":"\u5f00\u59cb ' + $timeText + '"}')
+            [Console]::Out.WriteLine('{"continue":true,"systemMessage":"\ud83d\udfe2 \u5f00\u59cb\uff1a' + $timeText + '"}')
         }
         elseif ($Event -eq 'Stop') {
             [Console]::Out.WriteLine('{"continue":true,"systemMessage":"\u4efb\u52a1\u7edf\u8ba1\u751f\u6210\u5931\u8d25\uff0c\u5df2\u8df3\u8fc7\uff1bCodex \u4efb\u52a1\u4e0d\u53d7\u5f71\u54cd\u3002"}')
@@ -4135,7 +4135,9 @@ function Build-Summary {
     $fileReasons = [Collections.Generic.List[string]]::new()
     foreach ($reason in @($fileSummary.Reasons) + @((Get-PropertyValue -Object $ActivityObservation -Name 'Reasons' -Default @()))) { if ($reason -and -not $fileReasons.Contains([string]$reason)) { $fileReasons.Add([string]$reason) } }
     if ($null -eq $ActivityObservation) { $fileReasons.Add('文件变更记录不可用') }
-    if ([string](Get-PropertyValue -Object $State -Name 'startSource') -ne 'UserPromptSubmit') { $fileReasons.Add('缺少本次回答的起始记录') }
+    # 压缩可能先创建状态；后到的用户输入已有计数，不能仅凭创建来源判断缺失。
+    if ([int](Get-PropertyValue -Object $State -Name 'promptCount' -Default 0) -le 0 -and
+        [string](Get-PropertyValue -Object $State -Name 'startSource') -ne 'UserPromptSubmit') { $fileReasons.Add('缺少本次回答的起始记录') }
     $knownPaths = @{}; foreach ($id in $fileSummary.PathIds) { $knownPaths[$id]=$true }
     foreach ($operation in $fileOperations) {
         foreach ($property in @('pathId','sourceId','targetId')) {
@@ -4214,7 +4216,7 @@ function Build-Summary {
     $status = Resolve-TurnStatus -StopPayload $StopPayload
     $endDisplay = Format-DisplayTime -Time $EndedAt -OtherTime $startedAt
     $durationDisplay = Format-Duration -Milliseconds $durationMs
-    $firstLine = "结束 $endDisplay（用时 $durationDisplay）"
+    $firstLine = "🔴 结束：$endDisplay（用时：$durationDisplay）"
     $showSuccessStatus = [bool](Get-ConfigValue -Config $config -Path @('display', 'showSuccessStatus') -Default $false)
     if ($status.Code -ne 'completed' -or $showSuccessStatus) { $firstLine += '｜状态：' + $status.Display }
 
@@ -4257,7 +4259,7 @@ function Build-Summary {
         $lines.Add('统计范围：' + $coverageText)
     }
 
-    $summary = if ([bool](Get-ConfigValue -Config $config -Path @('display', 'multiline') -Default $false)) { $lines -join "`n" } else { $lines -join '｜' }
+    $summary = if ([bool](Get-ConfigValue -Config $config -Path @('display', 'multiline') -Default $true)) { $lines -join "`n" } else { $lines -join '｜' }
 
     $skillEvidenceLevel = '无'
     $evidenceLabels = [System.Collections.Generic.List[string]]::new()
@@ -4528,7 +4530,7 @@ try {
             }
 
             Write-DebugRecord -Message ('输入处理阶段用时毫秒：准备=' + $preparedAtMs + '；加锁及写入=' + ($eventWatch.ElapsedMilliseconds - $preparedAtMs))
-            $inputMessage = if ([int]$state.promptCount -eq 1) { '开始 ' } else { '第 ' + $state.promptCount + ' 次输入 ' }
+            $inputMessage = if ([int]$state.promptCount -eq 1) { '🟢 开始：' } else { '第 ' + $state.promptCount + ' 次输入：' }
             Write-HookJsonOutput -SystemMessage ($inputMessage + $eventReceivedAt.ToLocalTime().ToString('HH:mm:ss'))
             exit 0
         }

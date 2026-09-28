@@ -1,16 +1,16 @@
 # Codex Task Stats
 
-The first input in each response (turn) shows its start time; additional inputs during that response each show their sequence number and input time in a separate notification. Stop measures elapsed time from that response's first input to its end. A new response resets timing and numbering, excluding idle time between responses. Additional inputs preserve file baselines, tool counts, Skills, and subagent statistics. Legacy session-wide timing caches are no longer used.
-
-File counts use successful native FileChange records and read only touched files. Patches reconstruct initial content, including edits later reverted. Missing evidence is marked incomplete. Agent names use validated short task names and explicit identity/child-session metadata, never positional matching. Prompt hooks have a 10-second outer timeout and a 1-second lock wait; prompt handling no longer scans the workspace.
-
 [简体中文](README.md) · **English**
+
+Current version: **v3.0**.
 
 > Privacy-first task telemetry for native Codex workflows on Windows. Track duration, MCP tools, Skills, subagents, file changes, Git activity, and local tool usage—automatically.
 
 <p align="center">
-  <img src="assets/preview.png" alt="Codex Task Stats task summary preview" width="760" />
+  <img src="assets/preview2.png" alt="Codex Task Stats task summary preview" width="760" />
 </p>
+
+Actual run with the default centered labels; incomplete file-change evidence produces an incomplete-statistics notice.
 
 Codex can spend a long time on complex tasks, but once a task finishes it can be surprisingly hard to answer simple questions: **How long did it run? Which MCP tools were used? Which Skills were invoked? How many subagents were started? How many files changed? What did Git actually do?**
 
@@ -23,8 +23,8 @@ If it makes long-running Codex work easier to understand, review, and debug, con
 - **Zero-friction task summaries** — show the start time and automatically summarize the task when it ends.
 - **Real MCP usage** — aggregate actual calls by `server/tool`.
 - **Multi-source Skill detection** — combine structured input, transcripts, subagent records, explicit markers, and `SKILL.md` read evidence.
-- **Subagent accounting** — deduplicate by real `agent_id` and use readable role names when they can be linked safely.
-- **File change summaries** — count added, modified and deleted paths from successful FileChange records; moves count as deletion of the source and addition of the destination.
+- **Subagent accounting** — prefer real `agent_id` deduplication and readable role names when they can be linked safely; retain successful-creation fallback counts when lifecycle events are absent.
+- **File change summaries** — count added, modified and deleted paths from successful `FileChange` records; moves count as deletion of the source and addition of the destination.
 - **Git semantics** — distinguish Git runs, commands, and state-changing operations; read-only commands and dry runs are not counted as changes.
 - **Privacy-first logs** — `safe` mode hides sensitive arguments, remote addresses, free-form text, and paths outside the workspace.
 - **Local and readable** — no service, database, or dashboard required; logs live directly under Codex Home.
@@ -32,39 +32,55 @@ If it makes long-running Codex work easier to understand, review, and debug, con
 
 ## What it looks like
 
+The summaries below and the log examples later in this document are illustrative and do not represent the same task. Actual entries and counts depend on the run.
+
 Task start:
 
 ```text
-🟢 开始：14:07:08
+🟢    开始    ：14:07:08
 ```
 
 Task completion:
 
 ```text
-🔴 结束：14:08:34（用时：1分26秒）
-🔌 MCP：mysql_7/query ×2
-🧩 Skill：analyze ×1
-🤖 子Agent：code_reviewer ×1，architect ×1
-📝 文件：修改 ×3
-🌿 Git：运行 ×2，指令 ×6，变更 ×1
-⚙️ 其他：Shell命令 ×2
+🔴    结束    ：14:08:34（用时：1分26秒）
+🔌    MCP    ：mysql_7/query ×2
+🧩    Skill     ：analyze ×1
+🤖 子Agent ：code_reviewer ×1，architect ×1
+📝    文件    ：修改 ×3
+🌿     Git      ：运行 ×2，指令 ×6，变更 ×1
+⚙️    其他    ：Shell命令 ×2
 ```
 
 Empty categories are hidden automatically. Successful tasks do not show a redundant “completed” status; failure, interruption, or unknown states are displayed explicitly.
 
 The client may wrap the card depending on available width. By default, Codex Task Stats enables `display.multiline` and inserts real line breaks between categories. Setting it to `false` restores one logical line separated with `｜`. How line breaks appear depends on the client. See [Hook display and newline diagnostics (Chinese)](HOOK_DISPLAY.md) for configuration semantics, verification results, and troubleshooting.
 
+In multiline mode, start notifications, additional-input notifications, and completion summaries default to `display.labelAlignment: "center"`. Use `left`, `right`, or `none` to change alignment. Padding uses plain spaces calculated from the Windows reference font; character-width estimates are used if font measurement is unavailable. Visual alignment depends on the client font. Single-line and bracket styles retain their existing format. Code-block examples show the output text, not its appearance in the client.
+
+Adjust these options in the installed configuration file. See [Local logs and configuration](#local-logs-and-configuration) for its location.
+
 ## Where the Hooks appear
 
-After installation, Hook events appear directly in the Codex / ChatGPT conversation timeline: `UserPromptSubmit` shows the task start time, while `Stop` shows the final task summary. Intermediate Hooks collect data silently by default, so they do not keep interrupting the conversation.
+After installation and any Hook trust review required by the client, Hook events appear in the Codex / ChatGPT conversation timeline: `UserPromptSubmit` shows the task start time, while `Stop` shows the final task summary. Intermediate Hooks collect data silently by default, so they do not keep interrupting the conversation.
 
 <p align="center">
-  <img src="assets/hook-location.gif" alt="Where Codex Task Stats Hooks appear in the client" width="900" />
+  <img src="assets/hook-location2.png" alt="Hook statistics button below the response, highlighted in red" width="900" />
 </p>
 
-The animation above shows where Hook cards appear. The exact client styling may change over time, but the statistics are still attached to Hook events near the task they belong to.
+The red box in the screenshot highlights the Hook statistics button below the response. Click it to view the details. The button's position and the client appearance may vary by version.
 
 > User-facing task text and local logs intentionally use Simplified Chinese; protocol names, identifiers, file names, and code-facing terms remain unchanged.
+
+## v3.0 changes and upgrade
+
+v3.0 brings together the statistics and display changes since v2.1: per-turn timing with additional-input and context-compaction recovery; file accounting verified against successful `FileChange` records and final content; reused subagents linked through validated identity and execution evidence; and multiline summaries with centered labels by default, plus left, right, and unaligned modes.
+
+The program version is independent of the configuration format: `schemaVersion` remains `11`. Legacy Git status scanning options no longer affect file counts, so counts may differ from older versions. Unreported writes can still be missed; insufficient evidence produces an incomplete-statistics notice.
+
+Use the same Codex Home as the original installation. Running the installer directly backs up and migrates existing configuration. To apply the current recommended display and collection options, run `scripts/apply-recommended-display.ps1` afterward; it overwrites those options. For a clean runtime and statistics state, back up custom configuration, run `scripts/uninstall.ps1 -RemoveProgram -Confirm:$false`, then reinstall. This uninstall mode preserves logs and backups but removes configuration, so reinstallation uses defaults. When specifying Codex Home explicitly, pass the same `-CodexHome` value to every script.
+
+After upgrading or reinstalling, run `scripts/status.ps1`, fully restart the client, and follow its Hook trust prompts before verifying a new task. Historical logs retain their original program version.
 
 ## Quick start
 
@@ -132,11 +148,18 @@ The installer merges only Codex Task Stats handlers into `hooks.json`; it does n
 ```powershell
 powershell.exe -NoLogo -NoProfile -NonInteractive `
   -ExecutionPolicy Bypass `
-  -File ".\scripts\status.ps1" `
-  -CodexHome "E:\.codex"
+  -File ".\scripts\status.ps1"
 ```
 
 The status script checks runtime files, syntax, configuration, Hook registration, and key runtime compatibility probes.
+
+Use the same Codex Home as the installation. If you supplied a custom directory, append the same argument to the command above, for example `-CodexHome "E:\.codex"`. When using default resolution, keep the `CODEX_HOME` environment variable consistent with the installation.
+
+### 5. Review Hook trust and verify the first run
+
+Follow the current client's prompts to review and trust new or changed Hook definitions. Non-managed Hooks are skipped until trusted; a changed definition may require another review. Codex CLI provides `/hooks` to manage trust; follow the actual prompts in the desktop client. See the [official Hook trust documentation](https://learn.chatgpt.com/docs/hooks#review-and-trust-hooks).
+
+After the review, run a new task and confirm that the start notification, completion summary, and corresponding record in the [local log directory](#local-logs-and-configuration) appear. A successful health check alone does not verify that the client actually triggers the Hooks.
 
 ## Detailed log example
 
@@ -180,9 +203,19 @@ See [`examples/detailed-task.log`](examples/detailed-task.log) for a full saniti
 
 ## Counting semantics
 
+### Tasks and elapsed time
+
+The first input in each response (`turn`) shows its start time; additional inputs during that response each show their sequence number and input time in a separate notification. Normally, `Stop` measures elapsed time from that response's first input to its end. A new response resets timing and numbering, excluding idle time between responses. Additional inputs preserve file baselines, tool counts, Skills, and subagent statistics. Legacy session-wide timing caches are no longer used.
+
+If an intermediate event such as compaction creates the turn state before the input arrives, the later input preserves that state's start time and collected records. The statistics may therefore start earlier than the input notification. Elapsed time currently prefers the difference between the saved turn start and end times and is affected by system clock adjustments. The monotonic clock is a fallback when the saved start is unavailable; if neither is usable, elapsed time is shown as unknown.
+
+The start Hook has a 10-second outer timeout and a 1-second internal lock wait; it does not scan the workspace.
+
 ### MCP
 
 Only actually executed MCP calls are counted, aggregated by `server/tool`. Identically named tools from different MCP servers remain separate.
+
+In addition to tool Hooks, native `McpToolCall` completion records in the current turn's transcript can supply missing calls, deduplicated by call ID. Failed but ended calls also count. Running calls, records without a stable ID, and tool names merely mentioned in code do not supply counts. Arguments and response bodies are not saved.
 
 ### Skills
 
@@ -190,17 +223,21 @@ Skill detection is multi-source and intentionally best-effort. Changes in client
 
 ### Subagents
 
-Subagents are deduplicated by `agent_id`. Human-readable names are display-only evidence; if a safe and reliable mapping is unavailable, the lifecycle `agent_type` is used instead.
+Subagents with a verified identity are deduplicated by `agent_id` within each turn. An existing subagent reused through `followup_task` is also counted when the successful call can be linked to its identity and both the parent-child relationship and execution records for the current turn are verified. Repeated follow-ups to the same subagent count once; ordinary messages and waits do not increase the count. Human-readable names are display-only evidence; if a safe and reliable mapping is unavailable, the lifecycle `agent_type` is used instead.
+
+When the aggregate contains no lifecycle start events, explicitly successful creation calls can supply fallback counts using stable call IDs. These fallback IDs do not establish a real Agent identity and cannot prove reuse or a parent-child relationship.
+
+Validated short task names are preferred. Names are linked through the `agent_id` returned by the creation call or through child-session metadata, never by event order. Paths, credential-like names, and prompts are not saved as display names.
 
 ### Files
 
 The client shows added, modified and deleted counts. Their sum is the confirmed total for this response, not necessarily the client's edited-file count. Moves count as source deletion and destination addition; each path belongs to at most one final category.
 
-Successful FileChange events are deduplicated per response. Patches reconstruct initial content using targeted final-file reads. Reverted edits and create/delete pairs cancel; edits to newly created files remain additions. Delete/recreate pairs depend on final content. Staging or committing existing changes adds no file count. Failed records are excluded; mid-turn input preserves prior records.
+Successful `FileChange` records are deduplicated per response. Patches reconstruct initial content using targeted final-file reads. Reverted edits and create/delete pairs cancel; edits to newly created files remain additions. Delete/recreate pairs depend on final content. Staging or committing existing changes adds no file count. Failed records are excluded; mid-turn input preserves prior records.
 
-There is no workspace scan; legacy gitStatusTimeoutMs and maxGitStatusEntries settings no longer affect file counts. Child transcripts are located only in the known transcript directory, checked against parent/child identities and restricted to the response time window. Changes are merged chronologically. CRLF/LF are normalized while final-newline differences are retained. Source text and diffs remain in memory, never in telemetry state or logs.
+There is no workspace scan; legacy `gitStatusTimeoutMs` and `maxGitStatusEntries` settings no longer affect file counts. Child transcripts are located only in the known transcript directory, checked against parent/child identities and restricted to the response time window. Changes are merged chronologically. CRLF/LF are normalized while final-newline differences are retained. Source text and diffs remain in memory, never in telemetry state or logs.
 
-Shell, MCP or IDE writes without FileChange records may be missed. Missing/conflicting patches, unreadable files, truncated records or unavailable child transcripts produce confirmed counts plus an incomplete notice and a logged reason. Targeted reads allow 4 MiB per file, 1000 paths and approximately 32 MiB of text; reading has a 2-second budget and reconstruction a 4-second total budget. Child collection allows 16 agents and 2 seconds. Verification covers collected records, not a complete disk audit.
+Shell, MCP or IDE writes without `FileChange` records may be missed. Missing/conflicting patches, unreadable files, truncated records or unavailable child transcripts produce confirmed counts plus an incomplete notice and a logged reason. Targeted reads allow 4 MiB per file, 1000 paths and approximately 32 MiB of text; reading has a 2-second budget and reconstruction a 4-second total budget. Child collection allows 16 agents and 2 seconds. Verification covers collected records, not a complete disk audit.
 
 ### Git
 
@@ -255,8 +292,6 @@ Before sharing an issue or log publicly, review it again for credentials, privat
 
 ## Local logs and configuration
 
-If a log write fails, the summary reports it and retains the frozen summary plus raw statistics. Another `Stop` for the same turn retries the write and cleans up only after success, preserving the original end time and counts. This is not an automatic background retry.
-
 Default log location:
 
 ```text
@@ -265,13 +300,15 @@ Default log location:
 
 Each task contains sections for task metadata, execution result, call statistics, file changes, Skill collection, and completeness. Logs avoid emoji so they remain easy to search, diff, and process with scripts.
 
+If a log write fails, the summary reports it and retains the frozen summary plus raw statistics. Another `Stop` for the same turn retries the write and cleans up only after success, preserving the original end time and counts. This is not an automatic background retry.
+
 Installed configuration:
 
 ```text
 <CodexHome>\task-stats\config\config.json
 ```
 
-[`config/config.example.json`](config/config.example.json) is the repository reference. It covers client labels/icons, Skill transcript windows, Git-assisted file collection, quiet intermediate Hooks, logging, `safe` / `off` command logging, and tool aliases.
+[`config/config.example.json`](config/config.example.json) is the repository reference. It covers client labels/icons, Skill transcript windows, quiet intermediate Hooks, logging, `safe` / `off` command logging, and tool aliases. See [file counting semantics](#files) for the counting rules and the limits of legacy settings.
 
 ## Uninstall
 
@@ -280,9 +317,10 @@ Remove Hooks only:
 ```powershell
 powershell.exe -NoLogo -NoProfile -NonInteractive `
   -ExecutionPolicy Bypass `
-  -File ".\scripts\uninstall.ps1" `
-  -CodexHome "E:\.codex"
+  -File ".\scripts\uninstall.ps1"
 ```
+
+Use the installation's Codex Home when uninstalling as well. If you supplied a custom directory, append the same `-CodexHome` argument to the command above. When using default resolution, keep the `CODEX_HOME` environment variable consistent with the installation.
 
 For all options:
 
@@ -313,5 +351,5 @@ codex-task-stats/
 - Skill counts depend on observable structured events, transcripts, and `SKILL.md` read evidence; format changes can cause omissions.
 - Some managed tools may not expose complete standard Hook events.
 - File changes caused indirectly through Shell commands cannot always be attributed perfectly.
-- Subagent display names are used only when they can be linked safely and reliably; identity counting still relies on `agent_id`.
+- Subagent display names are used only when they can be linked safely and reliably; successful-creation fallback counts do not establish a real Agent identity.
 - Token usage and cache hit rates are currently out of scope.

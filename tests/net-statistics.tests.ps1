@@ -17,7 +17,7 @@ foreach ($definition in $ast.EndBlock.Statements) {
 }
 . (Join-Path $ProjectRoot 'src\lib\SubagentCorrelation.ps1')
 $config = Get-Content -LiteralPath (Join-Path $ProjectRoot 'config\config.example.json') -Raw -Encoding UTF8 | ConvertFrom-Json
-$ProgramVersion = 'v2.1'
+$ProgramVersion = 'v3.0'
 $TestDurationMilliseconds = 0
 $testRoot = Join-Path ([IO.Path]::GetTempPath()) ('codex-net-stats-' + [Guid]::NewGuid().ToString('N'))
 $work = Join-Path $testRoot 'workspace'
@@ -84,7 +84,7 @@ try {
     $donePath = @(Get-ChildItem -LiteralPath (Join-Path $runtime 'data\completed') -File)[0].FullName
     $pending = Read-JsonFile $donePath
     Assert-Net $pending.logPending '失败后应保留待补写状态'
-    Assert-Net ($pending.summary -match 'Git：运行 ×1') ('Hook 必须采集真实测试命令；实际：' + $pending.summary)
+    Assert-Net ($pending.summary -match 'Git *：运行 ×1') ('Hook 必须采集真实测试命令；实际：' + $pending.summary)
     Assert-Net ($pending.pendingSummary.StartedAt -is [string] -and $pending.pendingSummary.EndedAt -is [string]) '冻结的时间必须是ISO字符串'
     Assert-Net (@(Get-ChildItem -LiteralPath (Join-Path $runtime 'data\journal') -File).Count -eq 1) '失败后不得删除原始Journal'
     Assert-Net (@(Get-ChildItem -LiteralPath (Join-Path $runtime 'data\state') -File).Count -eq 1) '失败后不得删除原始state'

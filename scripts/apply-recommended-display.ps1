@@ -108,6 +108,7 @@ $changed = $false
 if (Ensure-ObjectProperty -Object $config -Name 'display') { $changed = $true }
 if (Set-RecommendedValue -Object $config -Name 'schemaVersion' -Value 11) { $changed = $true }
 if (Set-RecommendedValue -Object $config.display -Name 'multiline' -Value $true) { $changed = $true }
+if (Set-RecommendedValue -Object $config.display -Name 'labelAlignment' -Value 'center') { $changed = $true }
 if (Set-RecommendedValue -Object $config.display -Name 'showCoverageNotice' -Value $false) { $changed = $true }
 if (Set-RecommendedValue -Object $config.display -Name 'showSuccessStatus' -Value $false) { $changed = $true }
 if (Set-RecommendedValue -Object $config.display -Name 'hideEmptyCategories' -Value $true) { $changed = $true }
@@ -116,6 +117,8 @@ if (Set-RecommendedValue -Object $config.display -Name 'highlightStyle' -Value '
 
 if (Ensure-ObjectProperty -Object $config.display -Name 'icons') { $changed = $true }
 foreach ($icon in @(
+    [PSCustomObject]@{ Name = 'start'; Value = '🟢' },
+    [PSCustomObject]@{ Name = 'end'; Value = '🔴' },
     [PSCustomObject]@{ Name = 'mcp'; Value = '🔌' },
     [PSCustomObject]@{ Name = 'skill'; Value = '🧩' },
     [PSCustomObject]@{ Name = 'subagent'; Value = '🤖' },
@@ -219,14 +222,14 @@ foreach ($setting in @(
 }
 
 if (-not $changed) {
-    Write-Host 'v2.1 推荐显示与采集配置已经生效。' -ForegroundColor Green
+    Write-Host 'v3.0 推荐显示与采集配置已经生效。' -ForegroundColor Green
     Write-Host '成功状态：客户端中隐藏'
     Write-Host '耗时：按整数秒显示'
     Write-Host '空分类：客户端中隐藏'
     Write-Host '非空分类：使用图标突出显示，Git 位于“其他”之前'
     Write-Host 'Skill 统计：结构化/transcript 证据、SKILL.md 读取以及 $skill 回退'
-    Write-Host '文件统计：apply_patch 解析加可选 Git 状态差异'
-    Write-Host 'Git 统计：只显示会产生变化的 Git 指令数量，位置在“其他”之前'
+    Write-Host '文件统计：根据成功 FileChange 记录与最终内容核验，证据不足时提示统计不完整'
+    Write-Host 'Git 统计：分别显示运行、指令与实际变更数量，位置在“其他”之前'
     Write-Host '命令日志：仅保存 safe 模式处理后的内容，原始命令和敏感信息不落盘'
     exit 0
 }
@@ -234,21 +237,21 @@ if (-not $changed) {
 $json = $config | ConvertTo-Json -Depth 50
 $null = $json | ConvertFrom-Json
 
-if ($PSCmdlet.ShouldProcess($ConfigPath, '应用 v2.1 推荐显示与采集配置')) {
+if ($PSCmdlet.ShouldProcess($ConfigPath, '应用 v3.0 推荐显示与采集配置')) {
     $null = New-Item -ItemType Directory -Path $BackupRoot -Force
     $timestamp = [DateTimeOffset]::Now.ToString('yyyyMMdd-HHmmss-fff')
     $backupPath = Join-Path $BackupRoot ('config.json.backup-' + $timestamp)
     Copy-Item -LiteralPath $ConfigPath -Destination $backupPath -Force
     Write-Utf8FileAtomic -Path $ConfigPath -Content $json
 
-    Write-Host 'v2.1 推荐配置已应用。' -ForegroundColor Green
+    Write-Host 'v3.0 推荐配置已应用。' -ForegroundColor Green
     Write-Host "备份：$backupPath"
     Write-Host '成功状态：客户端中隐藏；非成功状态继续显示'
     Write-Host '耗时：四舍五入到整数秒'
     Write-Host '空分类：客户端中隐藏'
     Write-Host '非空 MCP/Skill/子Agent/文件/Git/其他分类：使用图标突出显示'
     Write-Host 'Skill 统计：多源识别并包含 SKILL.md 读取证据；不校验已安装 Skill 名称'
-    Write-Host '文件重命名：只计为修改 ×1，不重复计入新增或删除'
+    Write-Host '文件重命名：原路径计为删除，新路径计为新增'
     Write-Host '每日日志：保留固定空字段、文件统计、Git 变更统计和安全命令明细'
     Write-Host '命令日志：仅允许 safe 或 off；疑似敏感信息和无法安全解析的参数会被隐藏'
     Write-Host '本脚本未修改 hooks.json，因此无需重新信任 Hook。'

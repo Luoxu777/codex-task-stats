@@ -2,12 +2,15 @@
   "schemaVersion": 11,
   "display": {
     "multiline": true,
+    "labelAlignment": "center",
     "showCoverageNotice": false,
     "showSuccessStatus": false,
     "hideEmptyCategories": true,
     "emptyValue": "无",
     "highlightStyle": "icon",
     "icons": {
+      "start": "🟢",
+      "end": "🔴",
       "mcp": "🔌",
       "skill": "🧩",
       "subagent": "🤖",

@@ -454,6 +454,69 @@ function Add-OrderedCount {
     $Counts[$Name] = [int]$Counts[$Name] + $Increment
 }
 
+function Get-LabelDisplayWidth {
+    param([string]$Label)
+    # ponytail: 按 Windows 客户端默认 Segoe UI 测量；自定义客户端字体仍需截图校准。
+    try {
+        if ($null -eq ('Windows.Media.FormattedText' -as [type])) { Add-Type -AssemblyName PresentationCore }
+        $typeface = New-Object Windows.Media.Typeface('Segoe UI')
+        $culture = [Globalization.CultureInfo]::GetCultureInfo('zh-CN')
+        $text = New-Object Windows.Media.FormattedText($Label, $culture, [Windows.FlowDirection]::LeftToRight, $typeface, 14, [Windows.Media.Brushes]::Black)
+        $space = New-Object Windows.Media.FormattedText(' ', $culture, [Windows.FlowDirection]::LeftToRight, $typeface, 14, [Windows.Media.Brushes]::Black)
+        return $text.WidthIncludingTrailingWhitespace / $space.WidthIncludingTrailingWhitespace
+    }
+    catch {
+        # 无法使用 Windows 字体测量时，沿用原来的字符列宽估算。
+    }
+    $width = 0
+    foreach ($character in $Label.ToCharArray()) {
+        $code = [int]$character
+        if (($code -ge 0x2E80 -and $code -le 0xA4CF) -or
+            ($code -ge 0xAC00 -and $code -le 0xD7A3) -or
+            ($code -ge 0xF900 -and $code -le 0xFAFF) -or
+            ($code -ge 0xFF01 -and $code -le 0xFF60)) { $width += 2 }
+        else { $width++ }
+    }
+    return $width
+}
+
+function Get-DisplayAlignmentOptions {
+    $alignment = [string](Get-ConfigValue -Config $config -Path @('display', 'labelAlignment') -Default 'center')
+    if ($alignment -notin @('center', 'left', 'right', 'none')) { $alignment = 'center' }
+    $options = @{ LabelWidth = 0.0; Alignment = $alignment }
+    if ([bool](Get-ConfigValue -Config $config -Path @('display', 'multiline') -Default $true) -and
+        (Get-HighlightStyle) -ne 'bracket' -and $alignment -ne 'none') {
+        $options.LabelWidth = Get-LabelDisplayWidth -Label '结束'
+        $defaults = @{ mcp = 'MCP'; skill = 'Skill'; subagent = '子Agent'; file = '文件'; git = 'Git'; other = '其他' }
+        foreach ($key in $defaults.Keys) {
+            $label = Sanitize-DisplayName -Value (Get-ConfigValue -Config $config -Path @('display', 'labels', $key) -Default $defaults[$key]) -Fallback $defaults[$key]
+            $options.LabelWidth = [Math]::Max($options.LabelWidth, (Get-LabelDisplayWidth -Label $label))
+        }
+    }
+    return $options
+}
+
+function Format-LabelPrefix {
+    param([string]$Label, [string]$HighlightStyle = 'none', [string]$Icon = '',
+        [double]$LabelWidth = 0, [string]$Alignment = 'none')
+
+    if ($LabelWidth -gt 0) {
+        $padding = [int][Math]::Max(0, [Math]::Round($LabelWidth - (Get-LabelDisplayWidth -Label $Label), [MidpointRounding]::AwayFromZero))
+        $left = switch ($Alignment) {
+            'left' { 0 }
+            'right' { $padding }
+            default { [int][Math]::Floor($padding / 2) }
+        }
+        $visibleIcon = if ($HighlightStyle -eq 'icon') { $Icon } else { '' }
+        return $visibleIcon + (' ' * (1 + $left)) + $Label + (' ' * (1 + $padding - $left)) + '：'
+    }
+    switch ($HighlightStyle) {
+        'icon' { if (-not [string]::IsNullOrWhiteSpace($Icon)) { return "$Icon $Label：" } }
+        'bracket' { return "【$Label】" }
+    }
+    return "$Label："
+}
+
 function Format-CountLine {
     param(
         [string]$Label,
@@ -462,11 +525,14 @@ function Format-CountLine {
         [string]$EmptyValue,
         [ValidateSet('icon', 'bracket', 'none')]
         [string]$HighlightStyle = 'none',
-        [string]$Icon = ''
+        [string]$Icon = '',
+        [double]$LabelWidth = 0,
+        [string]$Alignment = 'none'
     )
 
     if ($Order.Count -eq 0) {
-        return "$Label：$EmptyValue"
+        if ($LabelWidth -eq 0) { return "$Label：$EmptyValue" }
+        return (Format-LabelPrefix -Label $Label -HighlightStyle $HighlightStyle -Icon $Icon -LabelWidth $LabelWidth -Alignment $Alignment) + $EmptyValue
     }
 
     $parts = [System.Collections.Generic.List[string]]::new()
@@ -474,17 +540,7 @@ function Format-CountLine {
         $parts.Add("$name ×$($Counts[$name])")
     }
 
-    $prefix = "$Label："
-    switch ($HighlightStyle) {
-        'icon' {
-            if (-not [string]::IsNullOrWhiteSpace($Icon)) {
-                $prefix = "$Icon $Label："
-            }
-        }
-        'bracket' {
-            $prefix = "【$Label】"
-        }
-    }
+    $prefix = Format-LabelPrefix -Label $Label -HighlightStyle $HighlightStyle -Icon $Icon -LabelWidth $LabelWidth -Alignment $Alignment
 
     return $prefix + ($parts -join '，')
 }
@@ -499,24 +555,17 @@ function Format-GitLine {
         [string]$EmptyValue,
         [ValidateSet('icon', 'bracket', 'none')]
         [string]$HighlightStyle = 'none',
-        [string]$Icon = ''
+        [string]$Icon = '',
+        [double]$LabelWidth = 0,
+        [string]$Alignment = 'none'
     )
 
     if ($RunCount -le 0) {
-        return "$Label：$EmptyValue"
+        if ($LabelWidth -eq 0) { return "$Label：$EmptyValue" }
+        return (Format-LabelPrefix -Label $Label -HighlightStyle $HighlightStyle -Icon $Icon -LabelWidth $LabelWidth -Alignment $Alignment) + $EmptyValue
     }
 
-    $prefix = "$Label："
-    switch ($HighlightStyle) {
-        'icon' {
-            if (-not [string]::IsNullOrWhiteSpace($Icon)) {
-                $prefix = "$Icon $Label："
-            }
-        }
-        'bracket' {
-            $prefix = "【$Label】"
-        }
-    }
+    $prefix = Format-LabelPrefix -Label $Label -HighlightStyle $HighlightStyle -Icon $Icon -LabelWidth $LabelWidth -Alignment $Alignment
 
     $parts = [System.Collections.Generic.List[string]]::new()
     $parts.Add("运行 ×$RunCount")
@@ -3371,6 +3420,9 @@ function Get-TranscriptActivityObservation {
     $agentStarts = [ordered]@{}
     $fileChanges = [Collections.Generic.List[object]]::new()
     $agentIds = @{}
+    $followupCalls = @{}
+    $interactions = @{}
+    $taskActivityTimes = [Collections.Generic.List[DateTimeOffset]]::new()
     $currentTurn = $ExpectedTurnId
     $errors = 0
     $lineCount = 0
@@ -3397,8 +3449,25 @@ function Get-TranscriptActivityObservation {
                 continue
             }
             if ($at -lt $From -or $at -gt $Until) { continue }
+            if ($topType -eq 'event_msg' -and $type -in @('task_started', 'task_complete') -and $timeValue) {
+                $taskActivityTimes.Add($at)
+            }
             if ($topType -eq 'event_msg' -and $type -eq 'item_completed') {
                 $item = Get-PropertyValue -Object $p -Name 'item'
+                if ((Get-PropertyValue -Object $item -Name 'type') -eq 'SubAgentActivity' -and
+                    (Get-PropertyValue -Object $item -Name 'kind') -eq 'interacted' -and $timeValue) {
+                    $interactionId = [string](Get-PropertyValue -Object $item -Name 'id')
+                    $childId = ConvertTo-V21SafeAgentId -Value (Get-PropertyValue -Object $item -Name 'agent_thread_id')
+                    if ($interactionId -and $childId) {
+                        $metadata = Get-V21SafeSpawnMetadata -Payload ([pscustomobject]@{
+                            tool_response=[pscustomobject]@{task_name=(Get-PropertyValue -Object $item -Name 'agent_path')}
+                        })
+                        $interactions[$interactionId] = [pscustomobject]@{
+                            event='SubagentStart'; agentId=$childId; at=[string]$timeValue
+                            agentType=$(if ($metadata.DisplayName) { $metadata.DisplayName } else { 'default' })
+                        }
+                    }
+                }
                 if ((Get-PropertyValue -Object $item -Name 'type') -eq 'McpToolCall' -and
                     (Get-PropertyValue -Object $item -Name 'status') -in @('completed', 'failed')) {
                     $id = Normalize-StableId -Value (Get-PropertyValue -Object $item -Name 'id') -Fallback ''
@@ -3443,6 +3512,18 @@ function Get-TranscriptActivityObservation {
             if ($topType -ne 'response_item') { continue }
             $callId = [string](Get-PropertyValue -Object $p -Name 'call_id')
             if (-not $callId) { continue }
+            if ($type -eq 'function_call' -and
+                (([string](Get-PropertyValue -Object $p -Name 'name')).ToLowerInvariant() -replace '[^a-z0-9]', '') -in @('followuptask', 'collaborationfollowuptask')) {
+                if ($timeValue) { $followupCalls[$callId] = @{at=[string]$timeValue; succeeded=$false} }
+            }
+            elseif ($type -eq 'function_call_output' -and $followupCalls.ContainsKey($callId)) {
+                $outputValue = Get-PropertyValue -Object $p -Name 'output'
+                if ($outputValue -is [string] -and -not [string]::IsNullOrWhiteSpace($outputValue)) {
+                    try { $outputValue = $outputValue | ConvertFrom-Json } catch { continue }
+                }
+                $followupCalls[$callId].succeeded = (Test-V21SpawnPostSucceeded -Payload $p) -and
+                    (Test-V21SpawnPostSucceeded -Payload ([pscustomobject]@{tool_response=$outputValue}))
+            }
             if ($type -eq 'function_call' -and (Test-V21SubagentSpawnToolName -ToolName ([string](Get-PropertyValue -Object $p -Name 'name')))) {
                 $inputValue = Get-PropertyValue -Object $p -Name 'arguments'
                 $metadata = Get-V21SafeSpawnMetadata -Payload ([pscustomobject]@{tool_input=$inputValue})
@@ -3478,7 +3559,17 @@ function Get-TranscriptActivityObservation {
             spawnDisplayName=$start.agentType; spawnDisplayNameSource='task_name'
         }
     }
-    return [pscustomobject]@{PathIds=@($paths.Keys); EditIds=@($edits.Keys); EditCount=$edits.Count; Events=(@($spawns.Values) + @($mcpCalls.Values) + @($agentStarts.Values)); ParseErrors=$errors; FileChanges=@($fileChanges); AgentIds=@($agentIds.Keys); Reasons=@()}
+    # 交互本身不计数；只保留有成功 followup_task 调用的候选，交由子会话校验。
+    $followups = @{}
+    foreach ($callId in $interactions.Keys) {
+        if (-not $followupCalls.ContainsKey($callId) -or -not $followupCalls[$callId].succeeded) { continue }
+        $candidate = $interactions[$callId]
+        $candidate.at = $followupCalls[$callId].at
+        if (-not $followups.ContainsKey($candidate.agentId) -or [DateTimeOffset]$candidate.at -lt [DateTimeOffset]$followups[$candidate.agentId].at) {
+            $followups[$candidate.agentId] = $candidate
+        }
+    }
+    return [pscustomobject]@{PathIds=@($paths.Keys); EditIds=@($edits.Keys); EditCount=$edits.Count; Events=(@($spawns.Values) + @($mcpCalls.Values) + @($agentStarts.Values)); ParseErrors=$errors; FileChanges=@($fileChanges); AgentIds=@($agentIds.Keys); Reasons=@(); FollowupCandidates=@($followups.Values); TaskActivityTimes=$taskActivityTimes.ToArray()}
 }
 
 function Get-MainTranscriptActivityObservation {
@@ -3506,6 +3597,12 @@ function Add-ChildFileActivity {
     $parentId = [string](Get-PropertyValue -Object $State -Name 'sessionId')
     foreach ($id in @((Get-PropertyValue -Object $Observation -Name 'AgentIds' -Default @())) + @($Events | Where-Object { (Get-PropertyValue -Object $_ -Name 'event') -in @('SubagentStart','SubagentStop') } | ForEach-Object { Get-PropertyValue -Object $_ -Name 'agentId' })) {
         if ($id) { $queue.Enqueue(@{id=[string]$id; parent=$parentId}) }
+    }
+    $followups = @{}
+    $followupEvents = [Collections.Generic.List[object]]::new()
+    foreach ($candidate in @((Get-PropertyValue -Object $Observation -Name 'FollowupCandidates' -Default @()))) {
+        $followups[$candidate.agentId] = $candidate
+        $queue.Enqueue(@{id=[string]$candidate.agentId; parent=$parentId})
     }
     if ($queue.Count -eq 0) { return $Observation }
     $changes = [Collections.Generic.List[object]]::new()
@@ -3535,6 +3632,13 @@ function Add-ChildFileActivity {
             $slice = Read-TranscriptSlice -Path $matches[0].FullName -StartOffset 0
             $childCwd = [string](Get-PropertyValue -Object $identity -Name 'cwd' -Default (Get-PropertyValue -Object $StopPayload -Name 'cwd'))
             $child = Get-TranscriptActivityObservation -Text $slice.Text -ExpectedTurnId '' -Cwd $childCwd -Scope $agent.id -From $start -Until $EndedAt
+            if ($agent.parent -eq $parentId -and $followups.ContainsKey($agent.id)) {
+                $candidate = $followups[$agent.id]
+                # 父子身份和本轮执行证据都成立后才补计；旧轮活动不能证明本轮参与。
+                if (@($child.TaskActivityTimes | Where-Object { $_ -ge [DateTimeOffset]$candidate.at }).Count -gt 0) {
+                    $followupEvents.Add($candidate)
+                }
+            }
             foreach ($change in $child.FileChanges) { $changes.Add($change); $childEdits[$agent.id+"`n"+$change.EditId]=$true }
             foreach ($id in $child.AgentIds) { $queue.Enqueue(@{id=$id; parent=$agent.id}) }
             if ($slice.Truncated -or $child.ParseErrors -gt 0) { throw 'incomplete-child-transcript' }
@@ -3544,6 +3648,7 @@ function Add-ChildFileActivity {
     Set-PropertyValue -Object $Observation -Name 'FileChanges' -Value @($changes | Sort-Object At,Order)
     Set-PropertyValue -Object $Observation -Name 'Reasons' -Value @($reasons)
     Set-PropertyValue -Object $Observation -Name 'ChildEditCount' -Value $childEdits.Count
+    Set-PropertyValue -Object $Observation -Name 'FollowupEvents' -Value @($followupEvents)
     if ($reasons.Count -gt 0) { Set-PropertyValue -Object $Observation -Name 'Incomplete' -Value $true }
     return $Observation
 }
@@ -3831,6 +3936,7 @@ function Build-Summary {
         [object]$ActivityObservation = $null
     )
 
+    $Events = @($Events) + @((Get-PropertyValue -Object $ActivityObservation -Name 'FollowupEvents' -Default @()))
     $mcpCounts = @{}
     $mcpOrder = [System.Collections.ArrayList]::new()
     $skillCounts = @{}
@@ -4041,6 +4147,9 @@ function Build-Summary {
                 }
                 else {
                     $agentsById[$agentId].started = $true
+                    if (Test-V21WeakAgentType -Value ([string]$agentsById[$agentId].type)) {
+                        $agentsById[$agentId].type = Sanitize-DisplayName -Value (Get-PropertyValue -Object $journalEvent -Name 'agentType' -Default '') -Fallback $agentsById[$agentId].type
+                    }
                 }
             }
             'SubagentStop' {
@@ -4203,8 +4312,9 @@ function Build-Summary {
     $emptyValue = Sanitize-DisplayName -Value (Get-ConfigValue -Config $config -Path @('display', 'emptyValue') -Default '无') -Fallback '无'
     $highlightStyle = Get-HighlightStyle
     $icons = Get-ConfigValue -Config $config -Path @('display', 'icons') -Default $null
-    $iconMcp = '🔌'; $iconSkill = '🧩'; $iconAgent = '🤖'; $iconFile = '📝'; $iconGit = '🌿'; $iconOther = '⚙️'
+    $iconEnd = '🔴'; $iconMcp = '🔌'; $iconSkill = '🧩'; $iconAgent = '🤖'; $iconFile = '📝'; $iconGit = '🌿'; $iconOther = '⚙️'
     if ($null -ne $icons) {
+        $iconEnd = Sanitize-DisplayName -Value (Get-PropertyValue -Object $icons -Name 'end' -Default $iconEnd) -Fallback $iconEnd
         $iconMcp = Sanitize-DisplayName -Value (Get-PropertyValue -Object $icons -Name 'mcp' -Default $iconMcp) -Fallback $iconMcp
         $iconSkill = Sanitize-DisplayName -Value (Get-PropertyValue -Object $icons -Name 'skill' -Default $iconSkill) -Fallback $iconSkill
         $iconAgent = Sanitize-DisplayName -Value (Get-PropertyValue -Object $icons -Name 'subagent' -Default $iconAgent) -Fallback $iconAgent
@@ -4213,19 +4323,25 @@ function Build-Summary {
         $iconOther = Sanitize-DisplayName -Value (Get-PropertyValue -Object $icons -Name 'other' -Default $iconOther) -Fallback $iconOther
     }
 
+    $multiline = [bool](Get-ConfigValue -Config $config -Path @('display', 'multiline') -Default $true)
+    $alignmentOptions = Get-DisplayAlignmentOptions
+
     $status = Resolve-TurnStatus -StopPayload $StopPayload
     $endDisplay = Format-DisplayTime -Time $EndedAt -OtherTime $startedAt
     $durationDisplay = Format-Duration -Milliseconds $durationMs
-    $firstLine = "🔴 结束：$endDisplay（用时：$durationDisplay）"
+    $firstLine = "$iconEnd 结束：$endDisplay（用时：$durationDisplay）"
+    if ($alignmentOptions.LabelWidth -gt 0) {
+        $firstLine = (Format-LabelPrefix -Label '结束' -HighlightStyle $highlightStyle -Icon $iconEnd @alignmentOptions) + "$endDisplay（用时：$durationDisplay）"
+    }
     $showSuccessStatus = [bool](Get-ConfigValue -Config $config -Path @('display', 'showSuccessStatus') -Default $false)
     if ($status.Code -ne 'completed' -or $showSuccessStatus) { $firstLine += '｜状态：' + $status.Display }
 
-    $mcpClientLine = Format-CountLine -Label $labelMcp -Counts $mcpCounts -Order $mcpOrder -EmptyValue $emptyValue -HighlightStyle $highlightStyle -Icon $iconMcp
-    $skillClientLine = Format-CountLine -Label $labelSkill -Counts $skillCounts -Order $skillOrder -EmptyValue $emptyValue -HighlightStyle $highlightStyle -Icon $iconSkill
-    $agentClientLine = Format-CountLine -Label $labelAgent -Counts $agentCounts -Order $agentOrder -EmptyValue $emptyValue -HighlightStyle $highlightStyle -Icon $iconAgent
-    $fileClientLine = Format-CountLine -Label $labelFile -Counts $fileCounts -Order $fileOrder -EmptyValue $emptyValue -HighlightStyle $highlightStyle -Icon $iconFile
-    $gitClientLine = Format-GitLine -Label $labelGit -RunCount $gitRunCount -InstructionCount $gitInstructionCount -ChangeCount $gitChangeCount -EmptyValue $emptyValue -HighlightStyle $highlightStyle -Icon $iconGit
-    $otherClientLine = Format-CountLine -Label $labelOther -Counts $otherCounts -Order $otherOrder -EmptyValue $emptyValue -HighlightStyle $highlightStyle -Icon $iconOther
+    $mcpClientLine = Format-CountLine -Label $labelMcp -Counts $mcpCounts -Order $mcpOrder -EmptyValue $emptyValue -HighlightStyle $highlightStyle -Icon $iconMcp @alignmentOptions
+    $skillClientLine = Format-CountLine -Label $labelSkill -Counts $skillCounts -Order $skillOrder -EmptyValue $emptyValue -HighlightStyle $highlightStyle -Icon $iconSkill @alignmentOptions
+    $agentClientLine = Format-CountLine -Label $labelAgent -Counts $agentCounts -Order $agentOrder -EmptyValue $emptyValue -HighlightStyle $highlightStyle -Icon $iconAgent @alignmentOptions
+    $fileClientLine = Format-CountLine -Label $labelFile -Counts $fileCounts -Order $fileOrder -EmptyValue $emptyValue -HighlightStyle $highlightStyle -Icon $iconFile @alignmentOptions
+    $gitClientLine = Format-GitLine -Label $labelGit -RunCount $gitRunCount -InstructionCount $gitInstructionCount -ChangeCount $gitChangeCount -EmptyValue $emptyValue -HighlightStyle $highlightStyle -Icon $iconGit @alignmentOptions
+    $otherClientLine = Format-CountLine -Label $labelOther -Counts $otherCounts -Order $otherOrder -EmptyValue $emptyValue -HighlightStyle $highlightStyle -Icon $iconOther @alignmentOptions
 
     $mcpLogLine = Format-CountLine -Label $labelMcp -Counts $mcpCounts -Order $mcpOrder -EmptyValue $emptyValue
     $skillLogLine = Format-CountLine -Label $labelSkill -Counts $skillCounts -Order $skillOrder -EmptyValue $emptyValue
@@ -4236,7 +4352,7 @@ function Build-Summary {
 
     $lines = [System.Collections.Generic.List[string]]::new()
     if ($fileIncomplete) {
-        if ($fileOrder.Count -eq 0) { $fileClientLine = Format-CountLine -Label $labelFile -Counts $fileCounts -Order $fileOrder -EmptyValue '未确认' -HighlightStyle $highlightStyle -Icon $iconFile }
+        if ($fileOrder.Count -eq 0) { $fileClientLine = Format-CountLine -Label $labelFile -Counts $fileCounts -Order $fileOrder -EmptyValue '未确认' -HighlightStyle $highlightStyle -Icon $iconFile @alignmentOptions }
         $fileClientLine += '（统计不完整）'
     }
     $lines.Add($firstLine)
@@ -4259,7 +4375,7 @@ function Build-Summary {
         $lines.Add('统计范围：' + $coverageText)
     }
 
-    $summary = if ([bool](Get-ConfigValue -Config $config -Path @('display', 'multiline') -Default $true)) { $lines -join "`n" } else { $lines -join '｜' }
+    $summary = if ($multiline) { $lines -join "`n" } else { $lines -join '｜' }
 
     $skillEvidenceLevel = '无'
     $evidenceLabels = [System.Collections.Generic.List[string]]::new()
@@ -4530,7 +4646,14 @@ try {
             }
 
             Write-DebugRecord -Message ('输入处理阶段用时毫秒：准备=' + $preparedAtMs + '；加锁及写入=' + ($eventWatch.ElapsedMilliseconds - $preparedAtMs))
-            $inputMessage = if ([int]$state.promptCount -eq 1) { '🟢 开始：' } else { '第 ' + $state.promptCount + ' 次输入：' }
+            $iconStart = Sanitize-DisplayName -Value (Get-ConfigValue -Config $config -Path @('display', 'icons', 'start') -Default '🟢') -Fallback '🟢'
+            $inputMessage = if ([int]$state.promptCount -eq 1) { $iconStart + ' 开始：' } else { '第 ' + $state.promptCount + ' 次输入：' }
+            $alignmentOptions = Get-DisplayAlignmentOptions
+            if ($alignmentOptions.LabelWidth -gt 0) {
+                $inputLabel = if ([int]$state.promptCount -eq 1) { '开始' } else { '第 ' + $state.promptCount + ' 次输入' }
+                $inputIcon = if ([int]$state.promptCount -eq 1) { $iconStart } else { '' }
+                $inputMessage = Format-LabelPrefix -Label $inputLabel -HighlightStyle (Get-HighlightStyle) -Icon $inputIcon @alignmentOptions
+            }
             Write-HookJsonOutput -SystemMessage ($inputMessage + $eventReceivedAt.ToLocalTime().ToString('HH:mm:ss'))
             exit 0
         }

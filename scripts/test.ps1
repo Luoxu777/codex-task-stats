@@ -295,7 +295,10 @@ function Get-TaskStatsHandlerCount {
 try {
     $null = New-Item -ItemType Directory -Path $ConfigRoot -Force
     $null = New-Item -ItemType Directory -Path $WorkspaceRoot -Force
-    Copy-Item -LiteralPath $ConfigSource -Destination (Join-Path $ConfigRoot 'config.json') -Force
+    # 既有统计回归显式使用紧凑模式；四种排版由 display-alignment.tests.ps1 验证。
+    $compactConfig = Get-Content -LiteralPath $ConfigSource -Raw -Encoding UTF8 | ConvertFrom-Json
+    $compactConfig.display.labelAlignment = 'none'
+    [IO.File]::WriteAllText((Join-Path $ConfigRoot 'config.json'), ($compactConfig | ConvertTo-Json -Depth 50), $Utf8NoBom)
     Copy-Item -LiteralPath $VersionSource -Destination (Join-Path $TestRoot 'VERSION') -Force
     $env:CODEX_TASK_STATS_HOME = $TestRoot
 
@@ -357,7 +360,7 @@ try {
     $sampleReplayRoot = Join-Path $TestRoot 'sample-replay-home'
     $sampleReplayConfigRoot = Join-Path $sampleReplayRoot 'config'
     $null = New-Item -ItemType Directory -Path $sampleReplayConfigRoot -Force
-    Copy-Item -LiteralPath $ConfigSource -Destination (Join-Path $sampleReplayConfigRoot 'config.json') -Force
+    [IO.File]::WriteAllText((Join-Path $sampleReplayConfigRoot 'config.json'), ($compactConfig | ConvertTo-Json -Depth 50), $Utf8NoBom)
     Copy-Item -LiteralPath $VersionSource -Destination (Join-Path $sampleReplayRoot 'VERSION') -Force
     $env:CODEX_TASK_STATS_HOME = $sampleReplayRoot
     try {
@@ -751,7 +754,7 @@ Move-Item -LiteralPath $old -Destination $new
     foreach ($section in @('【任务信息】', '【执行结果】', '【调用统计】', '【文件变更】', '【Skill采集】', '【统计完整性】')) {
         Assert-Contains -Text $logText -Expected $section
     }
-    Assert-Contains -Text $logText -Expected '程序版本：v2.1'
+    Assert-Contains -Text $logText -Expected '程序版本：v3.0'
     Assert-NotContains -Text $logText -Unexpected '日志格式版本'
     Assert-Contains -Text $logText -Expected '状态：完成'
     Assert-Contains -Text $logText -Expected '状态来源：Hook推定'
@@ -1512,6 +1515,7 @@ function Invoke-V19SubagentCorrelationCompatibilityProbe {
         schemaVersion = 6
         display = [ordered]@{
             multiline = $true
+            labelAlignment = 'none'
             showCoverageNotice = $true
             emptyValue = '无'
             icons = $null
@@ -1566,7 +1570,7 @@ function Invoke-V19SubagentCorrelationCompatibilityProbe {
         throw '安装程序未复制 VERSION 文件。'
     }
     $installedVersion = [IO.File]::ReadAllText($installedVersionPath, [Text.Encoding]::UTF8).Trim()
-    if (-not [string]::Equals($installedVersion, 'v2.1', [StringComparison]::Ordinal)) {
+    if (-not [string]::Equals($installedVersion, 'v3.0', [StringComparison]::Ordinal)) {
         throw "已安装 VERSION 不正确： $installedVersion"
     }
 
@@ -1609,7 +1613,7 @@ function Invoke-V19SubagentCorrelationCompatibilityProbe {
             Select-Object -First 1
         if ($null -eq $installedLog) { throw '已安装运行时烟雾测试没有生成日志。' }
         $installedLogText = [IO.File]::ReadAllText($installedLog.FullName, [Text.Encoding]::UTF8)
-        Assert-Contains -Text $installedLogText -Expected '程序版本：v2.1'
+        Assert-Contains -Text $installedLogText -Expected '程序版本：v3.0'
     }
     finally {
         $MainScript = $sourceMainScriptForTests
@@ -1641,10 +1645,11 @@ function Invoke-V19SubagentCorrelationCompatibilityProbe {
     if ([bool]$installedAfterMerge.skillCollection.commandRead.requireCompletedExecution -ne $true) { throw '安装程序未要求已完成的命令执行证据。' }
     if ($null -eq $installedAfterMerge.fileTracking) { throw '安装程序未添加 fileTracking。' }
     if ([bool]$installedAfterMerge.display.multiline -ne $true) { throw '安装程序意外覆盖了现有 display.multiline 值。' }
+    if ($installedAfterMerge.display.labelAlignment -ne 'none') { throw '安装程序覆盖了已有对齐选择。' }
     if (-not [string]::Equals([string]$installedAfterMerge.toolAliases.apply_patch, '文件修改', [StringComparison]::Ordinal)) { throw '安装程序意外删除了应保留的旧别名。' }
     $installConfigBackup = Get-ChildItem -LiteralPath (Join-Path $fakeCodexHome 'task-stats\backups') -Filter 'config.json.backup-*' -File | Select-Object -First 1
     if ($null -eq $installConfigBackup) { throw '安装程序未备份现有 config.json。' }
-    $runtimeBackup = Get-ChildItem -LiteralPath (Join-Path $fakeCodexHome 'task-stats\backups') -Directory -Filter 'runtime.before-v2.1-*' | Select-Object -First 1
+    $runtimeBackup = Get-ChildItem -LiteralPath (Join-Path $fakeCodexHome 'task-stats\backups') -Directory -Filter 'runtime.before-v3.0-*' | Select-Object -First 1
     if ($null -eq $runtimeBackup) { throw '安装程序未创建升级前运行时备份。' }
     if (-not (Test-Path -LiteralPath (Join-Path $runtimeBackup.FullName 'codex-task-stats.ps1') -PathType Leaf)) {
         throw '运行时备份缺少升级前主处理器。'
@@ -1680,6 +1685,7 @@ function Invoke-V19SubagentCorrelationCompatibilityProbe {
     $updatedConfig = [IO.File]::ReadAllText($installedConfigPath, [Text.Encoding]::UTF8) | ConvertFrom-Json
     if ([int]$updatedConfig.schemaVersion -ne 11) { throw '推荐配置脚本未设置 schemaVersion 11。' }
     if ([bool]$updatedConfig.display.multiline -ne $true) { throw '推荐配置脚本未开启 multiline 输出。' }
+    if ($updatedConfig.display.labelAlignment -ne 'center') { throw '推荐配置脚本未启用居中。' }
     if ([bool]$updatedConfig.display.showCoverageNotice -ne $false) { throw '推荐配置脚本未隐藏客户端统计范围说明。' }
     if ([bool]$updatedConfig.display.showSuccessStatus -ne $false) { throw '推荐配置脚本未隐藏成功状态。' }
     if ([bool]$updatedConfig.display.hideEmptyCategories -ne $true) { throw '推荐配置脚本未隐藏空分类。' }
@@ -1709,7 +1715,7 @@ function Invoke-V19SubagentCorrelationCompatibilityProbe {
 
     $statusOutput = & powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $StatusScript | Out-String
     Assert-Contains -Text $statusOutput -Expected 'SourceVersion'
-    Assert-Contains -Text $statusOutput -Expected 'v2.1'
+    Assert-Contains -Text $statusOutput -Expected 'v3.0'
     Assert-Matches -Text $statusOutput -Pattern '(?m)^CodexHomeSource\s*:\s*EnvironmentVariable\s*$'
     $statusOutputWithoutWrappedLines = [Regex]::Replace($statusOutput, "\r?\n\s+", '')
     Assert-Contains -Text $statusOutputWithoutWrappedLines -Expected $fakeCodexHome
@@ -1986,6 +1992,8 @@ if ($LASTEXITCODE -ne 0) {
 
     & powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $ProjectRoot 'tests\runtime-recovery.tests.ps1')
     if ($LASTEXITCODE -ne 0) { throw '运行时恢复回归失败。' }
+    & powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $ProjectRoot 'tests\display-alignment.tests.ps1')
+    if ($LASTEXITCODE -ne 0) { throw '普通文本对齐回归失败。' }
     Write-Host '所有测试均已通过。' -ForegroundColor Green
     Write-Host ''
     Write-Host '开始输出：'

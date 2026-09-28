@@ -60,7 +60,7 @@ try {
     $null=New-Item -ItemType Directory -Path (Split-Path -Parent $legacyClockPath) -Force
     [IO.File]::WriteAllText($legacyClockPath,'{"startedAt":"2020-01-01T00:00:00+08:00","inputCount":99}',$Utf8NoBom)
     $first=Hook 'UserPromptSubmit' 'runtime-turn' @{prompt='$analyze'}
-    Assert-Runtime ($first.systemMessage -match '^🟢 开始：') '首次输入提示错误'
+    Assert-Runtime ($first.systemMessage -match '^🟢 +开始 +：') '首次输入提示错误'
     $statePath=Join-Path $stats ('data\state\'+(Get-Sha256Hex ($session+"`n"+'runtime-turn'))+'.json')
     $firstState=Get-Content $statePath -Raw -Encoding UTF8 | ConvertFrom-Json
     $null=Hook 'PostToolUse' 'runtime-turn' @{tool_name='mcp__filesystem__read_file';tool_use_id='mcp-before'}
@@ -69,7 +69,7 @@ try {
     for($i=0;$i -lt 7;$i++){[IO.File]::WriteAllText((Join-Path $work ('backend\file'+$i+'.txt')),'after',$Utf8NoBom)}
     $a=Start-RuntimeHook 'UserPromptSubmit'; $b=Start-RuntimeHook 'UserPromptSubmit'
     $messages=@((Finish-RuntimeHook $a).systemMessage,(Finish-RuntimeHook $b).systemMessage)
-    Assert-Runtime (@($messages -match '^第 2 次输入：').Count -eq 1 -and @($messages -match '^第 3 次输入：').Count -eq 1) '并发追加输入次数必须唯一'
+    Assert-Runtime (@($messages -match '^ +第 2 次输入 +：').Count -eq 1 -and @($messages -match '^ +第 3 次输入 +：').Count -eq 1) '并发追加输入次数必须唯一'
     $laterState=Get-Content $statePath -Raw -Encoding UTF8 | ConvertFrom-Json
     Assert-Runtime ($laterState.startedAt -eq $firstState.startedAt -and ($laterState.transcriptBaselineBytes -eq $firstState.transcriptBaselineBytes)) '追加输入不得覆盖文件基线或首次时间'
     Assert-Runtime ($laterState.promptCount -eq 3 -and $laterState.transcriptBaselineBytes -eq $firstState.transcriptBaselineBytes) '追加输入必须累加本轮次数，保留会话补采起点'
@@ -87,7 +87,7 @@ try {
     [IO.File]::WriteAllText($transcript,($records -join "`n")+"`n",$Utf8NoBom)
     $stop=Hook 'Stop'
     Assert-Runtime ($stop.systemMessage -match '修改 ×7' -and $stop.systemMessage -match '用时') '缺少编辑 Hook 时仍应确认 7 个文件'
-    foreach($expected in @('filesystem/read_file ×2','analyze ×1','code_reviewer ×1','Git：运行 ×1，指令 ×1','Shell命令 ×1')) {
+    foreach($expected in @('filesystem/read_file ×2','analyze ×1','code_reviewer ×1','运行 ×1，指令 ×1','Shell命令 ×1')) {
         Assert-Runtime ($stop.systemMessage.Contains($expected)) ('追加输入不得清空或重复累计 Stop 统计：'+$expected+'；实际：'+$stop.systemMessage)
     }
     $daily=Get-Content (Get-ChildItem (Join-Path $stats 'logs') -Filter '*.log' | Select-Object -First 1).FullName -Raw -Encoding UTF8
@@ -96,14 +96,14 @@ try {
     $retry=Hook 'Stop'
     Assert-Runtime ($retry.systemMessage -eq $stop.systemMessage) '重复 Stop 必须保留已冻结的全部统计'
     $next=Hook 'UserPromptSubmit' 'next-turn'
-    Assert-Runtime ($next.systemMessage -match '^🟢 开始：') 'Stop 后的新回答必须重新显示开始'
+    Assert-Runtime ($next.systemMessage -match '^🟢 +开始 +：') 'Stop 后的新回答必须重新显示开始'
     $nextState=Get-Content (Join-Path $stats ('data\state\'+(Get-Sha256Hex ($session+"`n"+'next-turn'))+'.json')) -Raw -Encoding UTF8 | ConvertFrom-Json
     Assert-Runtime ([DateTimeOffset]::Parse($nextState.startedAt) -gt [DateTimeOffset]::Parse($firstState.startedAt) -and $nextState.promptCount -eq 1) '新回答必须有独立的开始时间和输入次数'
     $nextExtra=Hook 'UserPromptSubmit' 'next-turn'
-    Assert-Runtime ($nextExtra.systemMessage -match '^第 2 次输入：') '新回答中的追加输入应从第 2 次开始'
+    Assert-Runtime ($nextExtra.systemMessage -match '^ +第 2 次输入 +：') '新回答中的追加输入应从第 2 次开始'
     $null=Hook 'Stop' 'next-turn'
     $netSummary=Get-Content (Join-Path $stats ('data\completed\'+(Get-Sha256Hex ($session+"`n"+'next-turn'))+'.json')) -Raw -Encoding UTF8 | ConvertFrom-Json
-    Assert-Runtime ($netSummary.summary -notmatch '修改 ×7|filesystem/read_file|analyze ×|code_reviewer ×|Shell命令 ×1|Git：运行 ×1') '新回答不能重复累计前一轮的文件、工具、Skill及子Agent统计'
+    Assert-Runtime ($netSummary.summary -notmatch '修改 ×7|filesystem/read_file|analyze ×|code_reviewer ×|Shell命令 ×1|Git *：运行 ×1') '新回答不能重复累计前一轮的文件、工具、Skill及子Agent统计'
 
     # Reproduce the real spawn response shape: task path, no agent_id.
     $spawnText=@(
@@ -170,8 +170,8 @@ try {
         Assert-Runtime ($timer.ElapsedMilliseconds -lt 5000 -and $locked.systemMessage -match '统计初始化未完成') '锁竞争应在外层期限前明确降级，不能假报已开始'
     } finally { $mutex.ReleaseMutex(); $mutex.Dispose() }
     $afterLock=Hook 'UserPromptSubmit' 'lock-turn'
-    Assert-Runtime ($afterLock.systemMessage -match '^第 2 次输入：') '未成功保存的输入不能提前消耗序号'
-    $ProgramVersion='v2.1'; $TestDurationMilliseconds=0
+    Assert-Runtime ($afterLock.systemMessage -match '^ +第 2 次输入 +：') '未成功保存的输入不能提前消耗序号'
+    $ProgramVersion='v3.0'; $TestDurationMilliseconds=0
     $fakeState=[pscustomobject]@{startedAt=[DateTimeOffset]::Now.ToString('o');startSource='UserPromptSubmit'}
     # Exact elapsed time uses this response's first input, never the legacy session start.
     $TestDurationMilliseconds=-1

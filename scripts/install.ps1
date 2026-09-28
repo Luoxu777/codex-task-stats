@@ -369,7 +369,7 @@ function Invoke-RuntimeSmokeTest {
         $startText = @($startOutput) -join "`n"
         $startObject = $startText | ConvertFrom-Json
         $startMessage = [string]$startObject.systemMessage
-        if ($startMessage -notmatch '^🟢 开始：[0-9]{2}:[0-9]{2}:[0-9]{2}$') {
+        if ($startMessage -notmatch '^🟢 +开始 *：[0-9]{2}:[0-9]{2}:[0-9]{2}$') {
             throw "$Label UserPromptSubmit 烟雾测试输出无效。"
         }
 
@@ -447,13 +447,13 @@ function Invoke-RuntimeSmokeTest {
         $stopText = @($stopOutput) -join "`n"
         $stopObject = $stopText | ConvertFrom-Json
         $stopMessage = [string]$stopObject.systemMessage
-        if ($stopMessage -match '任务统计生成失败' -or $stopMessage -notmatch '^🔴 结束：') {
+        if ($stopMessage -match '任务统计生成失败' -or $stopMessage -notmatch '^🔴 +结束 *：') {
             throw "$Label Stop 烟雾测试未生成正常摘要。"
         }
-        if ($stopMessage.IndexOf('子Agent：default ×1', [StringComparison]::Ordinal) -lt 0) {
+        if ($stopMessage -notmatch '子Agent *：default ×1') {
             throw "$Label Stop 烟雾测试未归并子 turn 的 SubagentStart。"
         }
-        if ($stopMessage.IndexOf('Git：运行 ×1，指令 ×2，变更 ×1', [StringComparison]::Ordinal) -lt 0) {
+        if ($stopMessage -notmatch 'Git *：运行 ×1，指令 ×2，变更 ×1') {
             throw "$Label Stop 烟雾测试未正确区分 git clean dry-run 与真实清理。"
         }
 
@@ -721,7 +721,7 @@ Assert-SubagentCorrelationRuntimeCompatibility -LibraryPath $SourceSubagentCorre
 
 $PackageVersion = [IO.File]::ReadAllText($SourceVersionPath, [Text.Encoding]::UTF8).Trim()
 if ($PackageVersion -notmatch '^v[0-9]+\.[0-9]$') {
-    throw "VERSION 值无效：$PackageVersion。预期格式为 v<主版本>.<更新号>，例如 v2.1。"
+    throw "VERSION 值无效：$PackageVersion。预期格式为 v<主版本>.<更新号>，例如 v3.0。"
 }
 
 try {

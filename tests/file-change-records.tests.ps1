@@ -31,9 +31,9 @@ function Case {
         $path=Join-Path $work $action.path;$detail=[ordered]@{type=$action.kind}
         switch($action.kind){
             'add' {$detail.content=$action.text;[IO.File]::WriteAllText($path,$action.text,$utf8)}
-            'delete' {$detail.content=[IO.File]::ReadAllText($path);Remove-Item -LiteralPath $path}
+            'delete' {$detail.content=[Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes($path));Remove-Item -LiteralPath $path}
             'update' {
-                $before=[IO.File]::ReadAllText($path);$detail.unified_diff=FullDiff $before $action.text
+                $before=[Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes($path));$detail.unified_diff=FullDiff $before $action.text
                 if($action.move){$detail.move_path=Join-Path $work $action.move;Remove-Item -LiteralPath $path;$path=$detail.move_path}
                 [IO.File]::WriteAllText($path,$action.text,$utf8)
             }
@@ -60,6 +60,28 @@ try {
     $null=Case 'rename-back' @{a='old'} @(@{kind='update';path='a';move='b';text='new'},@{kind='update';path='b';move='a';text='old'}) @(0,0,0)
     $null=Case 'empty-add' @{} @(@{kind='add';path='a';text=''}) @(1,0,0)
     $null=Case 'remove-last-newline' @{a="same`n"} @(@{kind='update';path='a';text='same';move=$null}) @(0,1,0)
+    $bom=[string][char]0xFEFF
+    $null=Case 'bom-add' @{} @(@{kind='add';path='a';text=($bom+"new`r`n")}) @(1,0,0)
+    $null=Case 'bom-delete' @{a=($bom+"old`n")} @(@{kind='delete';path='a'}) @(0,0,1)
+    $null=Case 'bom-add-delete' @{} @(@{kind='add';path='a';text=($bom+"new`n")},@{kind='delete';path='a'}) @(0,0,0)
+    $null=Case 'bom-add-edit' @{} @(@{kind='add';path='a';text=($bom+"old`n")},@{kind='update';path='a';text=($bom+"new`n");move=$null}) @(1,0,0)
+    $null=Case 'bom-update' @{a=($bom+"old`n")} @(@{kind='update';path='a';text=($bom+"new`n");move=$null}) @(0,1,0)
+    $null=Case 'bom-only-update' @{a="same`n"} @(@{kind='update';path='a';text=($bom+"same`n");move=$null}) @(0,0,0)
+    $null=Case 'bom-remove' @{a=($bom+"same`n")} @(@{kind='update';path='a';text="same`n";move=$null}) @(0,0,0)
+    $null=Case 'bom-empty-add' @{} @(@{kind='add';path='a';text=$bom}) @(1,0,0)
+    $null=Case 'bom-empty-update' @{a=''} @(@{kind='update';path='a';text=$bom;move=$null}) @(0,0,0)
+    $null=Case 'bom-empty-remove' @{a=$bom} @(@{kind='update';path='a';text='';move=$null}) @(0,0,0)
+    $null=Case 'bom-final-newline' @{a=($bom+"same`n")} @(@{kind='update';path='a';text=($bom+'same');move=$null}) @(0,1,0)
+    $null=Case 'bom-body-change' @{a="first`nsame`n"} @(@{kind='update';path='a';text=("first`n"+$bom+"same`n");move=$null}) @(0,1,0)
+    $null=Case 'bom-double-prefix' @{a=($bom+"same`n")} @(@{kind='update';path='a';text=($bom+$bom+"same`n");move=$null}) @(0,1,0)
+    # 复现真实事件：Shell 在新增后补写 BOM，删除记录保留它，最终仍应抵消。
+    $bomShell=Case 'bom-shell-add-delete' @{} @(@{kind='add';path='a';text="script`n"},@{kind='delete';path='a'}) @(0,0,0)
+    $bomShell.Changes[1].Detail.content=$bom+"script`r`n"
+    $summary=Get-NativeFileChangeSummary $bomShell.Changes $bomShell.Work
+    Check ($summary.Total-eq0-and$summary.Unknown-eq0-and$summary.Reasons.Count-eq0) '仅 BOM 和换行差异不能误报新增后删除的文件'
+    $bomShell.Changes[1].Detail.content=$bom+"changed script`n"
+    $summary=Get-NativeFileChangeSummary $bomShell.Changes $bomShell.Work
+    Check ($summary.Unknown-eq1-and$summary.Reasons -contains '新增记录缺失或与文件内容不匹配') '真实的正文差异仍须未确认并给出具体原因'
     $null=Case 'dirty-file' @{a='already dirty'} @(@{kind='update';path='a';text='this turn';move=$null}) @(0,1,0)
     $null=Case 'no-edit-commit-only' @{a='dirty'} @() @(0,0,0)
     $partial=Case 'partial' @{a='before'} @(@{kind='update';path='a';text='after';move=$null},@{kind='add';path='b';text='confirmed'}) @(1,1,0)
@@ -69,7 +91,7 @@ try {
     $mismatch=Case 'external-after-edit' @{a='before'} @(@{kind='update';path='a';text='after';move=$null}) @(0,1,0)
     [IO.File]::WriteAllText((Join-Path $mismatch.Work 'a'),'external edit',$utf8)
     $summary=Get-NativeFileChangeSummary $mismatch.Changes $mismatch.Work
-    Check ($summary.Total-eq0-and$summary.Unknown-eq1) '结束内容不匹配必须未确认'
+    Check ($summary.Total-eq0-and$summary.Unknown-eq1-and$summary.Reasons -contains '修改补丁与文件内容不匹配') '结束内容不匹配必须未确认并给出具体原因'
     $multi="@@ -1 +1 @@`n-a`n+A`n@@ -3 +3 @@`n-c`n+C`n"
     Check ((Undo-FileChangeDiff "A`nb`nC`n" $multi) -ceq "a`nb`nc`n") '多段补丁反推失败'
     Check ((Undo-FileChangeDiff "a`nb`n" "@@ -1,3 +1,2 @@`n a`n b`n-c`n") -ceq "a`nb`nc`n") '文件尾部删除反推失败'

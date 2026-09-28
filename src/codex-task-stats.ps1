@@ -2005,6 +2005,13 @@ function Get-ApplyPatchFileOperations {
     return @($operations)
 }
 
+function ConvertTo-FileChangeText {
+    param([AllowEmptyString()][string]$Text)
+    # 与 StreamReader 一致：只移除一个文件头 BOM，保留正文字符和末尾换行。
+    if ($Text.StartsWith([string][char]0xFEFF, [StringComparison]::Ordinal)) { $Text = $Text.Substring(1) }
+    return $Text.Replace("`r`n", "`n")
+}
+
 function Undo-FileChangeDiff {
     param([AllowEmptyString()][string]$Text, [AllowEmptyString()][string]$Diff)
     if ($Diff -eq '') { return $Text }
@@ -2013,7 +2020,7 @@ function Undo-FileChangeDiff {
     $previous = ''
     foreach ($line in ($Diff.Replace("`r`n", "`n") -split "`n")) {
         if ($line -match '^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@') {
-            $hunk = @{start=[int]$Matches[3]; oldCount=1; newCount=1; before=[Collections.Generic.List[string]]::new(); after=[Collections.Generic.List[string]]::new()}
+            $hunk = @{oldStart=[int]$Matches[1]; start=[int]$Matches[3]; oldCount=1; newCount=1; before=[Collections.Generic.List[string]]::new(); after=[Collections.Generic.List[string]]::new()}
             if ($Matches[2]) { $hunk.oldCount = [int]$Matches[2] }
             if ($Matches[4]) { $hunk.newCount = [int]$Matches[4] }
             $hunks.Add($hunk); $previous = ''; continue
@@ -2048,7 +2055,14 @@ function Undo-FileChangeDiff {
     for ($i=$hunks.Count-1; $i -ge 0; $i--) {
         $h = $hunks[$i]
         $start = if ($h.newCount -eq 0) { $h.start } else { $h.start - 1 }
-        if ($h.oldCount -ne $h.before.Count -or $h.newCount -ne $h.after.Count -or $start -lt 0 -or $start+$h.newCount -gt $lines.Count -or $start+$h.newCount -gt $nextStart) { throw 'invalid-diff-range' }
+        if ($h.oldCount -ne $h.before.Count -or $h.newCount -ne $h.after.Count) { throw 'invalid-diff-range' }
+        # 只有文件第一行可以带编码标记；其他行的 U+FEFF 属于正文。
+        if ($h.oldStart -eq 1 -and $h.before.Count -gt 0) { $h.before[0] = ConvertTo-FileChangeText $h.before[0] }
+        if ($h.start -eq 1 -and $h.after.Count -gt 0) { $h.after[0] = ConvertTo-FileChangeText $h.after[0] }
+        # 仅含 BOM 且无换行的文件，规范化后没有文本行。
+        if ($h.before.Count -eq 1 -and $h.before[0] -eq '') { $h.before.Clear(); $h.oldCount=0 }
+        if ($h.after.Count -eq 1 -and $h.after[0] -eq '') { $h.after.Clear(); $h.newCount=0 }
+        if ($start -lt 0 -or $start+$h.newCount -gt $lines.Count -or $start+$h.newCount -gt $nextStart) { throw 'invalid-diff-range' }
         for ($j=0; $j -lt $h.newCount; $j++) {
             if (-not [string]::Equals($lines[$start+$j], $h.after[$j], [StringComparison]::Ordinal)) { throw 'diff-content-mismatch' }
         }
@@ -2143,12 +2157,12 @@ function Get-NativeFileChangeSummary {
             switch ([string](Get-PropertyValue -Object $detail -Name 'type')) {
                 'add' {
                     if ($null -eq $detail.PSObject.Properties['content'] -or -not $current[$id].exists -or
-                        -not [string]::Equals($current[$id].text,([string]$detail.content).Replace("`r`n","`n"),[StringComparison]::Ordinal)) { throw 'add-content-mismatch' }
+                        -not [string]::Equals($current[$id].text,(ConvertTo-FileChangeText ([string]$detail.content)),[StringComparison]::Ordinal)) { throw 'add-content-mismatch' }
                     $current[$id] = @{exists=$false; text=''; known=$true}
                 }
                 'delete' {
                     if ($null -eq $detail.PSObject.Properties['content'] -or $current[$id].exists) { throw 'delete-content-missing' }
-                    $current[$id] = @{exists=$true; text=([string]$detail.content).Replace("`r`n","`n"); known=$true}
+                    $current[$id] = @{exists=$true; text=(ConvertTo-FileChangeText ([string]$detail.content)); known=$true}
                 }
                 'update' {
                     if ($null -eq $detail.PSObject.Properties['unified_diff'] -or -not $current[$target].exists -or ($target -ne $id -and $current[$id].exists)) { throw 'update-content-missing' }
@@ -2161,7 +2175,21 @@ function Get-NativeFileChangeSummary {
         }
         catch {
             $current[$id].known=$false; $current[$target].known=$false
-            if (-not $reasons.Contains('补丁或内容证据缺失、不匹配或文件不可读')) { $reasons.Add('补丁或内容证据缺失、不匹配或文件不可读') }
+            $reason = switch ($_.Exception.Message) {
+                'unknown-content' { '文件不可读或此前的内容证据未确认' }
+                'add-content-mismatch' { '新增记录缺失或与文件内容不匹配' }
+                'delete-content-missing' { '删除记录缺失或与文件状态不匹配' }
+                'update-content-missing' { '修改补丁缺失或与文件状态不匹配' }
+                'diff-content-mismatch' { '修改补丁与文件内容不匹配' }
+                'invalid-diff-range' { '修改补丁行数或范围不匹配' }
+                'missing-diff-hunks' { '修改补丁缺少有效片段' }
+                'unsupported-diff' { '修改补丁格式不支持' }
+                'unsupported-diff-line' { '修改补丁行格式不支持' }
+                'invalid-newline-marker' { '修改补丁换行标记无效' }
+                'unknown-change-type' { '文件变更类型不支持' }
+                default { '文件内容核验失败' }
+            }
+            if (-not $reasons.Contains($reason)) { $reasons.Add($reason) }
         }
     }
     $added=0; $modified=0; $deleted=0; $unknown=0

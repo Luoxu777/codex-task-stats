@@ -415,6 +415,8 @@ Values reuse the existing font measurement and plain-space padding used for labe
 
 If the initial prompt event is missing, collection is enabled mid-turn, or an older state is recovered, an unverified turn baseline is not treated as zero. A trustworthy conversation snapshot can still be displayed independently. Token reads are limited to the current transcript and at most 4 MiB and 10,000 lines per Hook. Insufficient evidence is marked incomplete; other conversations are not scanned. Unfinished JSONL lines do not contribute to statistics.
 
+A transcript larger than 4 MiB does not necessarily prevent turn statistics. Baseline lookback skips historical usage before the first identifiable turn boundary in the truncated prefix. If later records establish the preceding turn's cumulative usage, the current turn boundary and continuous current-turn records, the turn delta can still be calculated. A missing baseline or current-turn records exceeding the read budget still produces `未确认`. State is separated by session and turn identifiers, and each conversation uses only its own cumulative usage.
+
 Repeated Stop events and log-write retries reuse the first frozen result, without adding late usage. Configuration changes affect subsequent tasks; reopening a completed summary does not test a new setting. Token read failures do not prevent existing statistics from completing.
 
 ### Verification and troubleshooting

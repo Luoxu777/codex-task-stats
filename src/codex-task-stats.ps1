@@ -624,6 +624,8 @@ function Read-TokenObservation {
         $targetSeen = $false
         $targetClosed = $false
         $otherTurns = 0
+        # 起点回看从文件中段开始时，首个有效轮次边界之前的用量不能归属，也不能污染后续可信起点。
+        $skipUnscopedPrefix = $CaptureBaseline -and $start -gt 0
         $rawMetrics = @(Get-TokenMetrics | Where-Object { $_.Source })
         if ($continuous) {
             $currentTurn = [string]$Baseline.ContextTurn
@@ -654,6 +656,7 @@ function Read-TokenObservation {
                 $nextTurn = Get-TranscriptRecordTurnId -Record $record
                 if ($targetSeen -and $nextTurn -and $nextTurn -cne $ExpectedTurnId) { $targetClosed = $true; break }
                 $currentTurn = $nextTurn
+                if ($currentTurn) { $skipUnscopedPrefix = $false }
                 $contextEvidence = $evidence
                 if ($currentTurn -ceq $ExpectedTurnId -and -not $targetSeen) {
                     $beforeTarget = $latest
@@ -664,6 +667,7 @@ function Read-TokenObservation {
                 elseif ($currentTurn -cne $ExpectedTurnId) { $otherTurns++ }
             }
             if ($topType -ne 'event_msg' -or $kind -ne 'token_count') { continue }
+            if ($skipUnscopedPrefix -and -not $currentTurn) { continue }
             $value = Get-PropertyValue (Get-PropertyValue $payloadValue 'info') 'total_token_usage'
             if ($null -eq $value) { continue }
             $usage = ConvertTo-TokenUsage -Value $value

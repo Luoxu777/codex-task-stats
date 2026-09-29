@@ -18,6 +18,7 @@ Feature changes, fixes and compatibility notes. See the [README](README_EN.md) f
 
 ### Fixed
 
+- Fixed unscoped historical usage at the start of a long transcript's tail slice incorrectly invalidating a later trustworthy turn baseline and making all turn Token values display `未确认`.
 - Aligned the Hook template's start timeout with the installer's 10 seconds.
 - Completed uninstall parameter help, including option combinations and which logs and backups are retained.
 

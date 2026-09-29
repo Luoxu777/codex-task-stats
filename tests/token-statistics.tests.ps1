@@ -177,6 +177,33 @@ try {
     Check ((Observe $first).Session.Reasons -contains '缓存推导项缺少输入或缓存读取计数') '推导项缺失原因必须保存在观测结果'
     Add-Usage (Usage 1 1 0 0)
     Check ((Observe $first).Turn.Unknown -and (Observe $first).Session.Reasons -contains '累计计数回退') '计数回退不能作差'
+
+    # 大文件尾读从旧轮次中间开始；只有边界明确的历史用量才能作为新轮次起点。
+    Reset-Transcript; Start-Turn 'cropped-history'
+    $padding=(@{type='response_item';payload=@{text=('x'*1024)}} | ConvertTo-Json -Depth 4 -Compress)+"`n"
+    [IO.File]::AppendAllText($transcript,(-join (1..4300 | ForEach-Object {$padding})),$utf8)
+    Add-Usage (Usage 1000000 100000 500000 10000)
+    $croppedHistory=[IO.File]::ReadAllText($transcript)
+    Start-Turn 'previous'; Add-Usage (Usage 100 10 50 5); Start-Turn
+    $longHistoryBaseline=Capture
+    Check ($longHistoryBaseline.Valid -and $longHistoryBaseline.Usage.total -eq 110) '历史超过读取额度但存在可信上一轮与本轮边界时，起点应有效'
+    Add-Usage (Usage 150 25 70 10)
+    $longHistoryObservation=Observe $longHistoryBaseline
+    Check (-not $longHistoryObservation.Turn.Unknown -and $longHistoryObservation.Turn.Usage.total -eq 65) '截取开头的历史用量不能污染本轮增量'
+    Check ($longHistoryObservation.Session.Usage.total -eq 175 -and $longHistoryObservation.BytesRead -le 4194304) '修复长历史不能改变累计值或突破读取额度'
+    Add-Usage (Usage 140 25 70 10)
+    Check ((Observe $longHistoryBaseline).Turn.Unknown) '长历史中的本轮累计回退仍须拒绝计算'
+    [IO.File]::WriteAllText($transcript,$croppedHistory,$utf8)
+    Start-Turn; $missingPrevious=Capture; Add-Usage (Usage 150 25 70 10)
+    Check (-not $missingPrevious.Valid -and (Observe $missingPrevious).Turn.Unknown) '首个可见边界已是本轮时，不能将无归属历史用量或零作为起点'
+    [IO.File]::WriteAllText($transcript,$croppedHistory,$utf8)
+    Start-Turn 'previous'; Add-Usage (Usage 100 10 50 5)
+    Append-Record @{type='turn_context';payload=@{}}
+    Add-Usage (Usage 120 15 60 5); Start-Turn
+    Check (-not (Capture).Valid) '已找到有效边界后再丢失轮次归属，不能按截取前缀跳过'
+    Reset-Transcript; Add-Usage (Usage 100 10 50 5); Start-Turn
+    Check (-not (Capture).Valid) '完整读取的小文件仍须拒绝缺少轮次归属的起点'
+
     Reset-Transcript; Start-Turn; $first=Capture
     $padding=(@{type='response_item';payload=@{text=('x'*1024)}} | ConvertTo-Json -Depth 4 -Compress)+"`n"
     [IO.File]::AppendAllText($transcript,(-join (1..4300 | ForEach-Object {$padding})),$utf8)
@@ -230,6 +257,29 @@ try {
     [IO.File]::WriteAllText($oldStatePath,($oldState | ConvertTo-Json -Depth 20),$utf8)
     Add-Usage; $null=Hook 'Stop' 'old-state'
     Check (Completed 'old-state').tokenStatistics.Turn.Unknown '升级后的旧状态不能假定零起点'
+
+    # 两个对话故意使用相同 turn_id，交错开始、记录用量与结束，验证 session_id 隔离。
+    $originalSession=$session; $originalTranscript=$transcript
+    try {
+        $session='chat-a'; $transcript=Join-Path $root 'chat-a.jsonl'
+        Reset-Transcript; Start-Turn 'previous'; Add-Usage (Usage 100 10 50 5); Start-Turn 'shared-turn'
+        $null=Hook 'UserPromptSubmit' 'shared-turn'
+        $session='chat-b'; $transcript=Join-Path $root 'chat-b.jsonl'
+        Reset-Transcript; Start-Turn 'previous'; Add-Usage (Usage 1000 100 500 50); Start-Turn 'shared-turn'
+        $null=Hook 'UserPromptSubmit' 'shared-turn'
+        Add-Usage (Usage 1400 160 700 70)
+        $session='chat-a'; $transcript=Join-Path $root 'chat-a.jsonl'
+        Add-Usage (Usage 150 25 70 10)
+        $null=Hook 'Stop' 'shared-turn'; $chatA=Completed 'shared-turn'
+        $session='chat-b'; $transcript=Join-Path $root 'chat-b.jsonl'
+        $null=Hook 'Stop' 'shared-turn'; $chatB=Completed 'shared-turn'
+        Check ($chatA.tokenStatistics.Turn.Usage.total -eq 65 -and $chatA.tokenStatistics.Session.Usage.total -eq 175) '对话 A 必须仅使用自身起点和累计值'
+        Check ($chatB.tokenStatistics.Turn.Usage.total -eq 460 -and $chatB.tokenStatistics.Session.Usage.total -eq 1560) '对话 B 必须独立计算，不能混入对话 A'
+        $crossSession=Read-TokenObservation $transcript 'chat-a' 'shared-turn'
+        Check ($crossSession.Turn.Unknown -and $crossSession.Session.Unknown) '错误对话的记录必须被会话身份检查拒绝'
+    }
+    finally { $session=$originalSession; $transcript=$originalTranscript }
+
     Reset-Transcript; Start-Turn 'no-log'
     $config.logging.enabled=$false; Save-Config
     $null=Hook 'UserPromptSubmit' 'no-log'; Add-Usage

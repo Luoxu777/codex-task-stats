@@ -2034,6 +2034,8 @@ if ($LASTEXITCODE -ne 0) {
     if ($LASTEXITCODE -ne 0) { throw '运行时恢复回归失败。' }
     & powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $ProjectRoot 'tests\display-alignment.tests.ps1')
     if ($LASTEXITCODE -ne 0) { throw '普通文本对齐回归失败。' }
+    & powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $ProjectRoot 'tests\documentation.tests.ps1')
+    if ($LASTEXITCODE -ne 0) { throw '开源文档一致性检查失败。' }
     Write-Host '所有测试均已通过。' -ForegroundColor Green
     Write-Host ''
     Write-Host '开始输出：'

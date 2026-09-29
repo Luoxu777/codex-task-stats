@@ -454,6 +454,374 @@ function Add-OrderedCount {
     $Counts[$Name] = [int]$Counts[$Name] + $Increment
 }
 
+function Get-TokenMetrics {
+    @(
+        @{ Key='total'; Label='总量'; Source='total_tokens' }
+        @{ Key='input'; Label='输入'; Source='input_tokens' }
+        @{ Key='output'; Label='输出'; Source='output_tokens' }
+        @{ Key='cachedInput'; Label='缓存读取'; Source='cached_input_tokens' }
+        @{ Key='uncachedInput'; Label='未命中缓存输入'; Source='' }
+        @{ Key='cacheWrite'; Label='缓存写入'; Source='cache_write_input_tokens' }
+        @{ Key='cacheHitRate'; Label='缓存命中率'; Source='' }
+        @{ Key='reasoningOutput'; Label='推理输出'; Source='reasoning_output_tokens' }
+        @{ Key='nonReasoningOutput'; Label='非推理输出'; Source='' }
+        @{ Key='reasoningShare'; Label='推理占比'; Source='' }
+    )
+}
+
+function Get-TokenOptions {
+    $section = Get-ConfigValue -Config $config -Path @('tokenStatistics') -Default $null
+    $options = [ordered]@{ Enabled=$true; ShowTurn=$true; ShowSession=$true; Fields=@((Get-TokenMetrics) | ForEach-Object { $_.Key }) }
+    foreach ($key in @('enabled','showTurn','showSession')) {
+        $value = Get-PropertyValue -Object $section -Name $key -Default $true
+        if ($value -is [bool]) { $options[$key] = $value }
+        else { Write-DebugRecord -Message ('Token 配置类型无效，采用默认值：' + $key) }
+    }
+    if ($null -ne $section) {
+        $property = $section.PSObject.Properties['fields']
+        if ($null -ne $property) {
+            if ($property.Value -is [array] -and @($property.Value | Where-Object { $_ -isnot [string] }).Count -eq 0) {
+                $options.Fields = @($options.Fields | Where-Object { $property.Value -ccontains $_ })
+            }
+            else { Write-DebugRecord -Message 'Token 配置类型无效，采用默认值：fields' }
+        }
+    }
+    return [pscustomobject]$options
+}
+
+function ConvertTo-TokenUsage {
+    param([object]$Value, [switch]$Zero)
+    $usage = [ordered]@{}
+    $invalid = [Collections.Generic.List[string]]::new()
+    foreach ($metric in @(Get-TokenMetrics | Where-Object { $_.Source })) {
+        $number = Get-PropertyValue -Object $Value -Name $metric.Source
+        $usage[$metric.Key] = $null
+        if ($Zero) { $usage[$metric.Key] = [Int64]0 }
+        elseif ($null -ne $number) {
+            if (($number -is [int] -or $number -is [long]) -and $number -ge 0) { $usage[$metric.Key] = [Int64]$number }
+            else { $invalid.Add($metric.Key) }
+        }
+    }
+    $usage.InvalidFields = @($invalid)
+    return [pscustomobject]$usage
+}
+
+function Get-TokenUsageProblems {
+    param([object]$Usage, [switch]$IncludeMissingDerived)
+    if ($null -eq $Usage) { return }
+    if (@($Usage.InvalidFields).Count -gt 0) { '用量字段不是有效非负整数' }
+    if ($null -ne $Usage.input -and $null -ne $Usage.cachedInput -and $Usage.cachedInput -gt $Usage.input) { '缓存读取大于输入' }
+    if ($null -ne $Usage.output -and $null -ne $Usage.reasoningOutput -and $Usage.reasoningOutput -gt $Usage.output) { '推理输出大于输出' }
+    if ($null -ne $Usage.total -and $null -ne $Usage.input -and $null -ne $Usage.output -and
+        [decimal]$Usage.total -ne ([decimal]$Usage.input + [decimal]$Usage.output)) { '总量与输入加输出不一致' }
+    if ($IncludeMissingDerived) {
+        if ($null -eq $Usage.input -or $null -eq $Usage.cachedInput) { '缓存推导项缺少输入或缓存读取计数' }
+        if ($null -eq $Usage.output -or $null -eq $Usage.reasoningOutput) { '推理推导项缺少输出或推理计数' }
+    }
+}
+
+function Read-TokenBytes {
+    param([IO.FileStream]$Stream, [Int64]$Offset, [int]$Count)
+    $null = $Stream.Seek($Offset, [IO.SeekOrigin]::Begin)
+    $buffer = [byte[]]::new($Count)
+    $read = 0
+    while ($read -lt $Count) {
+        $n = $Stream.Read($buffer, $read, $Count - $read)
+        if ($n -eq 0) { throw 'Token 读取期间文件缩短。' }
+        $read += $n
+    }
+    return ,$buffer
+}
+
+function Read-TokenObservation {
+    param([string]$Path, [string]$ExpectedSessionId, [string]$ExpectedTurnId,
+        [object]$Baseline = $null, [switch]$CaptureBaseline)
+
+    $result = [pscustomobject]@{
+        Turn = [pscustomobject]@{ Usage=$null; Unknown=$true; Reasons=@('无可信本轮起点') }
+        Session = [pscustomobject]@{ Usage=$null; Unknown=$false; Reasons=@() }
+        Baseline = $null
+        Source = '主会话记录；读取时快照；独立子Agent覆盖未确认'
+        BytesRead = 0
+        LinesRead = 0
+    }
+    $stream = $null
+    try {
+        if (-not $Path -or -not $ExpectedSessionId -or $ExpectedSessionId -eq 'unknown-session' -or
+            -not $ExpectedTurnId -or $ExpectedTurnId -eq 'unknown-turn') { throw '缺少会话或轮次标识。' }
+        $stream = [IO.FileStream]::new($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+        [Int64]$length = $stream.Length
+        # ponytail: 每个 Hook 的读取固定为 4 MiB / 10,000 行；额度不足标记不完整，不建设历史索引。
+        $head = Read-TokenBytes -Stream $stream -Offset 0 -Count ([int][Math]::Min(65536, $length))
+        $result.BytesRead += $head.Length
+        $headText = [Text.Encoding]::UTF8.GetString($head).TrimStart([char]0xFEFF)
+        $newline = $headText.IndexOf("`n")
+        if ($newline -lt 0) { throw '会话头记录尚未完整。' }
+        $meta = $headText.Substring(0, $newline) | ConvertFrom-Json
+        if ((Get-PropertyValue $meta 'type') -ne 'session_meta' -or
+            (Get-PropertyValue (Get-PropertyValue $meta 'payload') 'id') -cne $ExpectedSessionId) { throw '会话来源不匹配。' }
+        $result.LinesRead++
+        $pathHash = Get-FileIdentityHash -PathValue $Path -Cwd ''
+        $anchorValid = $false
+        if ($null -ne $Baseline) {
+            if ((Get-PropertyValue $Baseline 'SessionId') -cne $ExpectedSessionId -or
+                (Get-PropertyValue $Baseline 'TurnId') -cne $ExpectedTurnId -or
+                (Get-PropertyValue $Baseline 'PathHash') -cne $pathHash -or
+                [Int64]$Baseline.Offset -gt $length) { throw '起始快照来源或文件长度变化。' }
+            $anchor = Read-TokenBytes -Stream $stream -Offset ([Int64]$Baseline.AnchorOffset) -Count ([int]$Baseline.AnchorLength)
+            $result.BytesRead += $anchor.Length
+            $anchorValid = (Get-Sha256Hex -Text ([Convert]::ToBase64String($anchor))) -ceq $Baseline.AnchorHash
+            if (-not $anchorValid) { throw '起始快照片段已变化。' }
+            $sourceAnchors = @(Get-PropertyValue $Baseline 'SourceAnchors' -Default @())
+            if ($Baseline.Valid -and $sourceAnchors.Count -eq 0) { throw '缺少起始累计记录证据。' }
+            foreach ($sourceAnchor in $sourceAnchors) {
+                if ($sourceAnchor.Length -lt 1 -or $sourceAnchor.Length -gt 65536 -or $sourceAnchor.Offset -lt 0 -or
+                    ([decimal]$sourceAnchor.Offset + $sourceAnchor.Length) -gt $Baseline.Offset -or $sourceAnchors.Count -gt 3) { throw '起始累计记录边界无效。' }
+                $sourceBytes = Read-TokenBytes -Stream $stream -Offset ([Int64]$sourceAnchor.Offset) -Count ([int]$sourceAnchor.Length)
+                $result.BytesRead += $sourceBytes.Length
+                if ((Get-Sha256Hex -Text ([Text.Encoding]::UTF8.GetString($sourceBytes))) -cne $sourceAnchor.Hash) { throw '起始累计记录或轮次边界已变化。' }
+            }
+        }
+        # 留出一个字节边界检查和至多 1 KiB 的新基线指纹。
+        $remaining = 4194304 - $result.BytesRead - 1025
+        [Int64]$start = [Math]::Max(0, $length - $remaining)
+        $continuous = $anchorValid -and $start -le [Int64]$Baseline.Offset
+        if ($continuous) { $start = [Int64]$Baseline.Offset }
+        $skipFirst = $false
+        if ($start -gt 0) {
+            $previousByte = Read-TokenBytes -Stream $stream -Offset ($start - 1) -Count 1
+            $result.BytesRead++
+            $skipFirst = $previousByte[0] -ne 10
+        }
+        $bytes = Read-TokenBytes -Stream $stream -Offset $start -Count ([int]($length - $start))
+        $result.BytesRead += $bytes.Length
+        # 只接受完整换行结尾的 JSONL；EOF 也可能是仍在写入的半行。
+        $lastLf = [Array]::LastIndexOf($bytes, [byte]10)
+        [Int64]$completeEnd = $start
+        [Int64]$cursor = $start
+        $text = ''
+        if ($lastLf -ge 0) {
+            $completeEnd = $start + $lastLf + 1
+            $text = [Text.Encoding]::UTF8.GetString($bytes, 0, $lastLf + 1)
+            if ($start -eq 0 -and $text.StartsWith([string][char]0xFEFF, [StringComparison]::Ordinal)) { $text=$text.Substring(1); $cursor+=3 }
+        }
+        if ($skipFirst -and $text) {
+            $firstLength = $text.IndexOf("`n") + 1
+            $cursor += [Array]::IndexOf($bytes, [byte]10) + 1
+            $text = $text.Substring($firstLength)
+        }
+        $issues = [Collections.Generic.List[string]]::new()
+        if ($completeEnd -lt $length) { $issues.Add('末尾记录尚未完整') }
+        if ($null -ne $Baseline -and -not $continuous) { $issues.Add('本轮连续记录超出读取额度') }
+        $currentTurn = ''
+        $latestTurn = ''
+        $latest = $null
+        $latestEvidence = $null
+        $beforeEvidence = $null
+        $contextEvidence = $null
+        $targetLatest = $null
+        $beforeTarget = $null
+        $targetSeen = $false
+        $targetClosed = $false
+        $otherTurns = 0
+        $rawMetrics = @(Get-TokenMetrics | Where-Object { $_.Source })
+        if ($continuous) {
+            $currentTurn = [string]$Baseline.ContextTurn
+            $latestTurn = [string](Get-PropertyValue $Baseline 'LatestTurn' -Default '')
+            $latest = $Baseline.LatestUsage
+            if ($currentTurn -ceq $ExpectedTurnId) { $targetSeen = $true }
+            if ($latestTurn -ceq $ExpectedTurnId) { $targetLatest = $latest }
+        }
+        foreach ($line in ($text -split "`n")) {
+            $recordOffset = $cursor
+            $recordLength = [Text.Encoding]::UTF8.GetByteCount($line) + 1
+            $cursor += $recordLength
+            if (-not $line.Trim()) { continue }
+            if ($result.LinesRead -ge 10000) { $issues.Add('记录行数超出读取额度'); break }
+            $result.LinesRead++
+            try { $record = $line | ConvertFrom-Json -ErrorAction Stop }
+            catch { $issues.Add('记录解析失败'); $currentTurn = ''; continue }
+            $topType = [string](Get-PropertyValue $record 'type')
+            $payloadValue = Get-PropertyValue $record 'payload'
+            $kind = [string](Get-PropertyValue $payloadValue 'type')
+            $evidence = $null
+            if ($CaptureBaseline -and $recordLength -le 65536 -and
+                ($topType -eq 'turn_context' -or ($topType -eq 'event_msg' -and $kind -in @('task_started','token_count')))) {
+                $evidence = [pscustomobject]@{ Offset=$recordOffset; Length=$recordLength; Hash=(Get-Sha256Hex -Text ($line+"`n")) }
+            }
+            if ($topType -eq 'session_meta' -and (Get-PropertyValue $payloadValue 'id') -cne $ExpectedSessionId) { throw '记录跨越其他会话。' }
+            if ($topType -eq 'turn_context' -or ($topType -eq 'event_msg' -and $kind -eq 'task_started')) {
+                $nextTurn = Get-TranscriptRecordTurnId -Record $record
+                if ($targetSeen -and $nextTurn -and $nextTurn -cne $ExpectedTurnId) { $targetClosed = $true; break }
+                $currentTurn = $nextTurn
+                $contextEvidence = $evidence
+                if ($currentTurn -ceq $ExpectedTurnId -and -not $targetSeen) {
+                    $beforeTarget = $latest
+                    $beforeEvidence = $latestEvidence
+                    if ($null -eq $latest -and $start -eq 0 -and $otherTurns -eq 0 -and $issues.Count -eq 0) { $beforeTarget = ConvertTo-TokenUsage -Zero }
+                    $targetSeen = $true
+                }
+                elseif ($currentTurn -cne $ExpectedTurnId) { $otherTurns++ }
+            }
+            if ($topType -ne 'event_msg' -or $kind -ne 'token_count') { continue }
+            $value = Get-PropertyValue (Get-PropertyValue $payloadValue 'info') 'total_token_usage'
+            if ($null -eq $value) { continue }
+            $usage = ConvertTo-TokenUsage -Value $value
+            foreach ($metric in $rawMetrics) {
+                $old = Get-PropertyValue $latest $metric.Key
+                $new = Get-PropertyValue $usage $metric.Key
+                if ($null -ne $old -and $null -ne $new -and $new -lt $old) { $issues.Add('累计计数回退') }
+            }
+            $latest = $usage
+            $latestTurn = $currentTurn
+            $latestEvidence = $evidence
+            if (-not $currentTurn) { $issues.Add('用量缺少轮次边界') }
+            if ($currentTurn -ceq $ExpectedTurnId) { $targetLatest = $usage }
+        }
+        $result.Session.Usage = $targetLatest
+        if ($null -eq $targetLatest) { $issues.Add('未找到本轮可归属用量') }
+        foreach ($problem in @(Get-TokenUsageProblems $targetLatest)) { $issues.Add($problem) }
+        if ($CaptureBaseline) {
+            $startUsage = $beforeTarget
+            if (-not $targetSeen -and $currentTurn -and $currentTurn -cne $ExpectedTurnId) { $startUsage = $latest; $beforeEvidence = $latestEvidence }
+            # 会话只有头记录时，尚不能证明当前轮次的零起点。
+            $valid = -not $targetClosed -and $null -ne $startUsage -and @(Get-TokenUsageProblems $startUsage).Count -eq 0 -and @($issues | Where-Object { $_ -ne '未找到本轮可归属用量' }).Count -eq 0
+            if ($null -eq $contextEvidence -or ($null -ne $latest -and $null -eq $latestEvidence)) { $valid = $false }
+            $evidenceByOffset = @{}
+            foreach ($item in @($beforeEvidence,$latestEvidence,$contextEvidence)) {
+                if ($null -ne $item) { $evidenceByOffset[[string]$item.Offset] = $item }
+            }
+            $anchorOffset = [Math]::Max(0, $completeEnd - 1024)
+            $anchor = Read-TokenBytes -Stream $stream -Offset $anchorOffset -Count ([int]($completeEnd - $anchorOffset))
+            $result.BytesRead += $anchor.Length
+            $result.Baseline = [pscustomobject]@{
+                SessionId=$ExpectedSessionId; TurnId=$ExpectedTurnId; PathHash=$pathHash
+                Offset=$completeEnd; AnchorOffset=$anchorOffset; AnchorLength=$anchor.Length
+                AnchorHash=(Get-Sha256Hex -Text ([Convert]::ToBase64String($anchor)))
+                Usage=$startUsage; Valid=$valid; ContextTurn=$currentTurn; LatestUsage=$latest; LatestTurn=$latestTurn
+                SourceAnchors=@($evidenceByOffset.Values)
+            }
+        }
+        elseif ($continuous -and [bool]$Baseline.Valid -and $null -ne $targetLatest -and $issues.Count -eq 0) {
+            $delta = [ordered]@{}
+            foreach ($metric in $rawMetrics) {
+                $before = Get-PropertyValue $Baseline.Usage $metric.Key
+                $after = Get-PropertyValue $targetLatest $metric.Key
+                $delta[$metric.Source] = $null
+                if ($null -ne $before -and $null -ne $after) {
+                    if ($after -lt $before) { $issues.Add('本轮累计计数回退') }
+                    else { $delta[$metric.Source] = [Int64]($after - $before) }
+                }
+            }
+            if ($issues.Count -eq 0) {
+                $result.Turn.Usage = ConvertTo-TokenUsage -Value ([pscustomobject]$delta)
+                $result.Turn.Unknown = $false
+                $result.Turn.Reasons = @(Get-TokenUsageProblems $result.Turn.Usage -IncludeMissingDerived)
+            }
+        }
+        if ($result.Turn.Unknown) { $result.Turn.Reasons = @(@('无可信本轮起点或连续用量') + @($issues) | Select-Object -Unique) }
+        $result.Session.Reasons = @(@($issues) + @(Get-TokenUsageProblems $targetLatest -IncludeMissingDerived) | Select-Object -Unique)
+    }
+    catch {
+        # 不记录异常正文、会话正文或本地路径。
+        $result.Turn.Reasons = @('会话记录不可用或来源变化')
+        $result.Session = [pscustomobject]@{ Usage=$null; Unknown=$true; Reasons=@('会话记录不可用或来源变化') }
+    }
+    finally { if ($null -ne $stream) { $stream.Dispose() } }
+    return $result
+}
+
+function Format-TokenValue {
+    param([object]$Range, [object]$Metric)
+    if ($null -eq $Range) { if ($Metric.Source) { return '未提供' }; return '未确认' }
+    if ($Range.Unknown) { return '未确认' }
+    $usage = $Range.Usage
+    if ($null -eq $usage) { if ($Metric.Source) { return '未提供' }; return '未确认' }
+    if ($Metric.Source) {
+        if (@($usage.InvalidFields) -contains $Metric.Key) { return '未确认' }
+        $value = Get-PropertyValue $usage $Metric.Key
+        if ($null -eq $value) { return '未提供' }
+        return ([Int64]$value).ToString('N0', [Globalization.CultureInfo]::InvariantCulture)
+    }
+    $inputField = if ($Metric.Key -in @('uncachedInput','cacheHitRate')) { 'input' } else { 'output' }
+    $partField = if ($inputField -eq 'input') { 'cachedInput' } else { 'reasoningOutput' }
+    if (@($usage.InvalidFields) -contains $inputField -or @($usage.InvalidFields) -contains $partField) { return '未确认' }
+    $whole = Get-PropertyValue $usage $inputField
+    $part = Get-PropertyValue $usage $partField
+    if ($null -eq $whole -or $null -eq $part) { return '未确认' }
+    if ($part -gt $whole) { return '未确认' }
+    if ($Metric.Key -in @('cacheHitRate','reasoningShare')) {
+        if ($whole -eq 0) { return '不适用' }
+        return ([Math]::Round(([decimal]$part * 100 / [decimal]$whole), 0, [MidpointRounding]::AwayFromZero)).ToString('0', [Globalization.CultureInfo]::InvariantCulture) + '%'
+    }
+    return ([Int64]($whole - $part)).ToString('N0', [Globalization.CultureInfo]::InvariantCulture)
+}
+
+function Get-TokenLines {
+    param([object]$Observation, [switch]$ForLog)
+    $options = Get-TokenOptions
+    if (-not $options.Enabled -and -not $ForLog) { return }
+    $metrics = @(Get-TokenMetrics)
+    if (-not $ForLog) { $metrics = @($metrics | Where-Object { $options.Fields -ccontains $_.Key }) }
+    if ($metrics.Count -eq 0) { return }
+    $alignment = @{ LabelWidth=0; Alignment='none' }
+    $style = 'none'
+    $multiline = $true
+    if (-not $ForLog) {
+        $alignment = Get-DisplayAlignmentOptions
+        $style = Get-HighlightStyle
+        $multiline = [bool](Get-ConfigValue -Config $config -Path @('display','multiline') -Default $true)
+    }
+    $scopes = @('Turn','Session' | Where-Object {
+        $ForLog -or ($_ -eq 'Turn' -and $options.ShowTurn) -or ($_ -eq 'Session' -and $options.ShowSession)
+    })
+    $rightAlignValues = -not $ForLog -and $multiline -and $alignment.LabelWidth -gt 0
+    $values = @{}
+    $valueWidths = @{}
+    $valueWidth = 0.0
+    foreach ($scope in $scopes) {
+        $range = Get-PropertyValue $Observation $scope
+        foreach ($metric in $metrics) {
+            $key = $scope + '/' + $metric.Key
+            $values[$key] = Format-TokenValue -Range $range -Metric $metric
+            if ($rightAlignValues) {
+                $valueWidths[$key] = Get-LabelDisplayWidth $values[$key]
+                $valueWidth = [Math]::Max($valueWidth, $valueWidths[$key])
+            }
+        }
+    }
+    $emitted = $false
+    foreach ($scope in $scopes) {
+        if ($emitted -and $multiline) { '' }
+        $emitted = $true
+        $label = if ($scope -eq 'Turn') { '本轮 Token' } else { '累计 Token' }
+        $icon = if ($scope -eq 'Turn') { '📊' } else { '📈' }
+        $range = Get-PropertyValue $Observation $scope
+        $notice = '读取时快照'
+        $reasons = @(Get-PropertyValue $range 'Reasons' -Default @())
+        if ($reasons.Count -gt 0) { $notice += '；统计不完整：' + ($reasons -join '；') }
+        if ($null -eq $Observation) { $notice += '；未提供' }
+        if ($ForLog) { '【' + $label + '】' }
+        elseif ($style -eq 'icon') { $icon + ' ' + $label + '（' + $notice + '）' }
+        else { $label + '（' + $notice + '）' }
+        if ($ForLog) { '状态：' + $notice }
+        foreach ($metric in $metrics) {
+            $prefix = Format-LabelPrefix -Label $metric.Label -HighlightStyle $style @alignment
+            if (-not $ForLog -and $multiline -and $alignment.LabelWidth -gt 0 -and $style -eq 'icon') {
+                $endIcon = Sanitize-DisplayName -Value (Get-ConfigValue -Config $config -Path @('display','icons','end') -Default '🔴') -Fallback '🔴'
+                $prefix = (' ' * [int][Math]::Round((Get-LabelDisplayWidth $endIcon), 0, [MidpointRounding]::AwayFromZero)) + $prefix
+            }
+            $key = $scope + '/' + $metric.Key
+            $padding = 0
+            if ($rightAlignValues) {
+                $padding = 1 + [int][Math]::Max(0, [Math]::Round($valueWidth - $valueWidths[$key], [MidpointRounding]::AwayFromZero))
+            }
+            $prefix + (' ' * $padding) + $values[$key]
+        }
+    }
+    if ($ForLog) { '统计来源：' + [string](Get-PropertyValue $Observation 'Source' -Default '主会话记录；读取时快照') }
+}
+
 function Get-LabelDisplayWidth {
     param([string]$Label)
     # ponytail: 按 Windows 客户端默认 Segoe UI 测量；自定义客户端字体仍需截图校准。
@@ -491,6 +859,12 @@ function Get-DisplayAlignmentOptions {
         foreach ($key in $defaults.Keys) {
             $label = Sanitize-DisplayName -Value (Get-ConfigValue -Config $config -Path @('display', 'labels', $key) -Default $defaults[$key]) -Fallback $defaults[$key]
             $options.LabelWidth = [Math]::Max($options.LabelWidth, (Get-LabelDisplayWidth -Label $label))
+        }
+        $tokenOptions = Get-TokenOptions
+        if ($tokenOptions.Enabled -and ($tokenOptions.ShowTurn -or $tokenOptions.ShowSession)) {
+            foreach ($metric in @(Get-TokenMetrics | Where-Object { $tokenOptions.Fields -ccontains $_.Key })) {
+                $options.LabelWidth = [Math]::Max($options.LabelWidth, (Get-LabelDisplayWidth -Label $metric.Label))
+            }
         }
     }
     return $options
@@ -3725,7 +4099,7 @@ function New-RunState {
     $transcriptBaseline = Get-TranscriptBaselineMetadata -PathValue (Get-PropertyValue -Object $Payload -Name 'transcript_path' -Default $null)
     $cwd = [string](Get-PropertyValue -Object $Payload -Name 'cwd' -Default '')
 
-    return [ordered]@{
+    $runState = [ordered]@{
         schemaVersion = 11
         sessionId = $SessionId
         turnId = $TurnId
@@ -3748,6 +4122,11 @@ function New-RunState {
         programVersion = $ProgramVersion
         createdAt = [DateTimeOffset]::Now.ToString('o')
     }
+    if ($StartSource -eq 'UserPromptSubmit' -and (Get-TokenOptions).Enabled) {
+        $observation = Read-TokenObservation -Path ([string](Get-PropertyValue $Payload 'transcript_path')) -ExpectedSessionId $SessionId -ExpectedTurnId $TurnId -CaptureBaseline
+        $runState.tokenBaseline = $observation.Baseline
+    }
+    return $runState
 }
 
 function Ensure-RunState {
@@ -3961,7 +4340,8 @@ function Build-Summary {
         [Int64]$EndMonotonicTicks,
         [object]$StopPayload,
         [object]$MainSkillObservation,
-        [object]$ActivityObservation = $null
+        [object]$ActivityObservation = $null,
+        [object]$TokenObservation = $null
     )
 
     $Events = @($Events) + @((Get-PropertyValue -Object $ActivityObservation -Name 'FollowupEvents' -Default @()))
@@ -4392,6 +4772,12 @@ function Build-Summary {
     if (-not $hideEmptyCategories -or $gitRunCount -gt 0) { $lines.Add($gitClientLine) }
     if (-not $hideEmptyCategories -or $otherOrder.Count -gt 0) { $lines.Add($otherClientLine) }
 
+    $tokenLines = @(Get-TokenLines -Observation $TokenObservation)
+    if ($tokenLines.Count -gt 0) {
+        if ($multiline) { $lines.Add('') }
+        foreach ($tokenLine in $tokenLines) { $lines.Add($tokenLine) }
+    }
+
     $coverageLimitations = @(
         'Skill 依赖结构化注入、transcript 或 SKILL.md 读取证据，格式变化或缺失可能导致遗漏',
         '托管工具可能没有完整的标准 Hook 事件',
@@ -4477,6 +4863,8 @@ function Build-Summary {
         CoverageText = $coverageText
         CoverageLimitations = @($coverageLimitations)
         ProgramVersion = $ProgramVersion
+        TokenStatistics = $TokenObservation
+        TokenLogLines = $(if ($null -ne $TokenObservation) { @(Get-TokenLines -Observation $TokenObservation -ForLog) } else { @() })
     }
 }
 
@@ -4503,6 +4891,8 @@ function Complete-PendingSummary {
         $done[$name] = Get-PropertyValue -Object $Completed -Name $name
     }
     $done.logFileName = if ($logPath) { [IO.Path]::GetFileName($logPath) } else { $null }
+    $tokenStatistics = Get-PropertyValue $built 'TokenStatistics'
+    if ($null -ne $tokenStatistics) { $done.tokenStatistics = $tokenStatistics }
     Write-Utf8FileAtomic -Path $completedPath -Content ($done | ConvertTo-Json -Compress -Depth 10)
     Remove-Item -LiteralPath $statePath -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $journalPath -Force -ErrorAction SilentlyContinue
@@ -4566,6 +4956,11 @@ function Write-DailyLog {
     $lines.Add('')
     Add-LogCountCategory -Lines $lines -Label '其他' -Items @($SummaryObject.OtherItems) -EmptyValue $SummaryObject.EmptyValue
     Add-LogShellCommandDetails -Lines $lines -Runs @($SummaryObject.ShellRuns)
+    $tokenLogLines = @(Get-PropertyValue $SummaryObject 'TokenLogLines' -Default @())
+    if ($tokenLogLines.Count -gt 0) {
+        $lines.Add('')
+        foreach ($tokenLogLine in $tokenLogLines) { $lines.Add([string]$tokenLogLine) }
+    }
     if ([string]::Equals([string]$SummaryObject.CommandLoggingMode, 'off', [StringComparison]::OrdinalIgnoreCase)) {
         $lines.Add('命令记录策略：off（不保存命令明细，原始命令不落盘）')
     }
@@ -4703,6 +5098,10 @@ try {
             try { $stateForSkillObservation = Read-JsonFile -Path $statePath } catch { }
             $mainSkillObservation = Get-MainTranscriptSkillObservation -State $stateForSkillObservation -StopPayload $Payload
             $activityObservation = Get-MainTranscriptActivityObservation -State $stateForSkillObservation -StopPayload $Payload
+            $tokenObservation = $null
+            if ((Get-TokenOptions).Enabled) {
+                $tokenObservation = Read-TokenObservation -Path ([string](Get-PropertyValue $Payload 'transcript_path')) -ExpectedSessionId $SessionId -ExpectedTurnId $TurnId -Baseline (Get-PropertyValue $stateForSkillObservation 'tokenBaseline')
+            }
 
             $summaryObject = Invoke-WithMutex -Name $runMutexName -TimeoutMs 10000 -ScriptBlock {
                 $done = $null
@@ -4736,7 +5135,7 @@ try {
                 $endedAt = $eventReceivedAt
                 $endTicks = [Diagnostics.Stopwatch]::GetTimestamp()
                 $activityObservation = Add-ChildFileActivity -Observation $activityObservation -Events $events -State $state -StopPayload $Payload -EndedAt $endedAt
-                $built = Build-Summary -State $state -Events $events -EndedAt $endedAt -EndMonotonicTicks $endTicks -StopPayload $Payload -MainSkillObservation $mainSkillObservation -ActivityObservation $activityObservation
+                $built = Build-Summary -State $state -Events $events -EndedAt $endedAt -EndMonotonicTicks $endTicks -StopPayload $Payload -MainSkillObservation $mainSkillObservation -ActivityObservation $activityObservation -TokenObservation $tokenObservation
 
                 $completed = [ordered]@{
                     schemaVersion = 11

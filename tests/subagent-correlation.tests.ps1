@@ -118,7 +118,7 @@ try {
     $mainSource = [IO.File]::ReadAllText((Join-Path $ProjectRoot 'src/codex-task-stats.ps1'))
     Assert-True ($mainSource -notmatch '未完成子Agent') '缺失 SubagentStop 不得进入客户端“其他”'
     $versionText = [IO.File]::ReadAllText((Join-Path $ProjectRoot 'VERSION'), [Text.Encoding]::UTF8).Trim()
-    Assert-True ([string]::Equals($versionText, 'v3.0', [StringComparison]::Ordinal)) 'VERSION 应为 v3.0'
+    Assert-True ([string]::Equals($versionText, 'v4.0', [StringComparison]::Ordinal)) 'VERSION 应为 v4.0'
     Assert-True ($mainSource -match 'schemaVersion = 11') '主处理器 state/completed schemaVersion 应为 11'
 
     $fallbackInput = @(

@@ -15,7 +15,7 @@ foreach ($definition in $ast.EndBlock.Statements) {
 }
 . (Join-Path $project 'src\lib\SubagentCorrelation.ps1')
 $config = Get-Content (Join-Path $project 'config\config.example.json') -Raw -Encoding UTF8 | ConvertFrom-Json
-$ProgramVersion = 'v3.0'
+$ProgramVersion = 'v4.0'
 $TestDurationMilliseconds = 0
 
 function Check { param([bool]$Condition, [string]$Message) if (-not $Condition) { throw $Message } }

@@ -15,7 +15,7 @@ foreach ($definition in $ast.EndBlock.Statements) {
 }
 . (Join-Path $project 'src\lib\SubagentCorrelation.ps1')
 $config = Get-Content (Join-Path $project 'config\config.example.json') -Raw -Encoding UTF8 | ConvertFrom-Json
-$ProgramVersion = 'v3.0'
+$ProgramVersion = 'v4.0'
 $TestDurationMilliseconds = 0
 $base = [DateTimeOffset]::Now.AddMinutes(-1)
 function Check { param([bool]$Condition, [string]$Message) if (-not $Condition) { throw $Message } }
@@ -114,7 +114,9 @@ try {
     Check ($starts.Count -eq 1 -and $starts[0].agentId -eq 'reviewer-id') '测试 Hook 必须实际保留真实 Agent ID'
     $stop = Hook 'Stop'
     Check ($stop.systemMessage -match 'code_reviewer ×1' -and $stop.systemMessage -match 'architect ×1') 'Stop 必须显示两个 Agent'
-    Check ($stop.systemMessage -notmatch '统计不完整|未命名Agent|default') ('完整的只读子 Agent 记录不应误报：'+$stop.systemMessage)
+    # 本样本只含 Agent 记录，不含 Token 来源；仅核验原分类的完整性。
+    $activityMessage = ([string]$stop.systemMessage -split '(?m)^📊', 2)[0]
+    Check ($activityMessage -notmatch '统计不完整|未命名Agent|default') ('完整的只读子 Agent 记录不应误报：'+$activityMessage)
     $logs = @(Get-ChildItem (Join-Path $env:CODEX_TASK_STATS_HOME 'logs') -Filter '*.log'|ForEach-Object{[IO.File]::ReadAllText($_.FullName)}) -join "`n"
     Check ($logs -match 'architect ×1' -and $logs -notmatch '子Agent文件记录缺失') '持久日志必须与摘要一致'
 

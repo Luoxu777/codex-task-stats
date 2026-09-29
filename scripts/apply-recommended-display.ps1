@@ -105,6 +105,16 @@ if ($null -eq $config -or $config -isnot [PSCustomObject]) {
 }
 
 $changed = $false
+if (Ensure-ObjectProperty -Object $config -Name 'tokenStatistics') { $changed = $true }
+foreach ($name in @('enabled','showTurn','showSession')) {
+    if (Set-RecommendedValue -Object $config.tokenStatistics -Name $name -Value $true) { $changed = $true }
+}
+$tokenFields = @('total','input','output','cachedInput','uncachedInput','cacheWrite','cacheHitRate','reasoningOutput','nonReasoningOutput','reasoningShare')
+if (($config.tokenStatistics.PSObject.Properties.Name -notcontains 'fields') -or
+    (($config.tokenStatistics.fields | ConvertTo-Json -Compress) -cne ($tokenFields | ConvertTo-Json -Compress))) {
+    $null = Set-RecommendedValue -Object $config.tokenStatistics -Name 'fields' -Value $tokenFields
+    $changed = $true
+}
 if (Ensure-ObjectProperty -Object $config -Name 'display') { $changed = $true }
 if (Set-RecommendedValue -Object $config -Name 'schemaVersion' -Value 11) { $changed = $true }
 if (Set-RecommendedValue -Object $config.display -Name 'multiline' -Value $true) { $changed = $true }
@@ -222,7 +232,7 @@ foreach ($setting in @(
 }
 
 if (-not $changed) {
-    Write-Host 'v3.0 推荐显示与采集配置已经生效。' -ForegroundColor Green
+    Write-Host 'v4.0 推荐显示与采集配置已经生效。' -ForegroundColor Green
     Write-Host '成功状态：客户端中隐藏'
     Write-Host '耗时：按整数秒显示'
     Write-Host '空分类：客户端中隐藏'
@@ -237,14 +247,14 @@ if (-not $changed) {
 $json = $config | ConvertTo-Json -Depth 50
 $null = $json | ConvertFrom-Json
 
-if ($PSCmdlet.ShouldProcess($ConfigPath, '应用 v3.0 推荐显示与采集配置')) {
+if ($PSCmdlet.ShouldProcess($ConfigPath, '应用 v4.0 推荐显示与采集配置')) {
     $null = New-Item -ItemType Directory -Path $BackupRoot -Force
     $timestamp = [DateTimeOffset]::Now.ToString('yyyyMMdd-HHmmss-fff')
     $backupPath = Join-Path $BackupRoot ('config.json.backup-' + $timestamp)
     Copy-Item -LiteralPath $ConfigPath -Destination $backupPath -Force
     Write-Utf8FileAtomic -Path $ConfigPath -Content $json
 
-    Write-Host 'v3.0 推荐配置已应用。' -ForegroundColor Green
+    Write-Host 'v4.0 推荐配置已应用。' -ForegroundColor Green
     Write-Host "备份：$backupPath"
     Write-Host '成功状态：客户端中隐藏；非成功状态继续显示'
     Write-Host '耗时：四舍五入到整数秒'

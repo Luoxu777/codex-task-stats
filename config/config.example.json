@@ -27,6 +27,23 @@
       "other": "其他"
     }
   },
+  "tokenStatistics": {
+    "enabled": true,
+    "showTurn": true,
+    "showSession": true,
+    "fields": [
+      "total",
+      "input",
+      "output",
+      "cachedInput",
+      "uncachedInput",
+      "cacheWrite",
+      "cacheHitRate",
+      "reasoningOutput",
+      "nonReasoningOutput",
+      "reasoningShare"
+    ]
+  },
   "skillCollection": {
     "mode": "multi-source",
     "explicitMarkers": [

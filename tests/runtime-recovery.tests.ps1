@@ -150,13 +150,15 @@ try {
         }
         if ($scenario -eq 'invalid-transcript') { [IO.File]::AppendAllText($transcript,"{invalid`n",$Utf8NoBom) }
         $compactStop=Hook 'Stop' $turn
+        # 本组只验证原活动恢复；Token 的缺基线状态由专属套件验证。
+        $compactActivity=([string]$compactStop.systemMessage -split '(?m)^📊',2)[0]
         Assert-Runtime ($compactStop.systemMessage -match '上下文压缩 ×1') '后到输入不能清空压缩事件'
         if ($scenario -in @('missing-prompt','invalid-transcript')) {
             Assert-Runtime ($compactStop.systemMessage -match '未确认（统计不完整）') ('真实缺失记录仍应提示不完整：'+$scenario)
         } else {
-            Assert-Runtime ($compactStop.systemMessage -notmatch '统计不完整') ('已有用户输入不能误报缺少起始记录：'+$scenario+'；'+$compactStop.systemMessage)
+            Assert-Runtime ($compactActivity -notmatch '统计不完整') ('已有用户输入不能误报缺少起始记录：'+$scenario+'；'+$compactActivity)
             if ($scenario -eq 'edits') { Assert-Runtime ($compactStop.systemMessage -match '新增 ×2') '用户输入前后的已采集文件变更都必须计入' }
-            else { Assert-Runtime ($compactStop.systemMessage -notmatch '新增|修改|删除|未确认') '只读回答不能产生文件变更' }
+            else { Assert-Runtime ($compactActivity -notmatch '新增|修改|删除|未确认') '只读回答不能产生文件变更' }
         }
     }
     $null=Hook 'UserPromptSubmit' 'lock-turn'
@@ -171,7 +173,7 @@ try {
     } finally { $mutex.ReleaseMutex(); $mutex.Dispose() }
     $afterLock=Hook 'UserPromptSubmit' 'lock-turn'
     Assert-Runtime ($afterLock.systemMessage -match '^ +第 2 次输入 +：') '未成功保存的输入不能提前消耗序号'
-    $ProgramVersion='v3.0'; $TestDurationMilliseconds=0
+    $ProgramVersion='v4.0'; $TestDurationMilliseconds=0
     $fakeState=[pscustomobject]@{startedAt=[DateTimeOffset]::Now.ToString('o');startSource='UserPromptSubmit'}
     # Exact elapsed time uses this response's first input, never the legacy session start.
     $TestDurationMilliseconds=-1

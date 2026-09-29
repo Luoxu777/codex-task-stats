@@ -298,6 +298,8 @@ try {
     # 既有统计回归显式使用紧凑模式；四种排版由 display-alignment.tests.ps1 验证。
     $compactConfig = Get-Content -LiteralPath $ConfigSource -Raw -Encoding UTF8 | ConvertFrom-Json
     $compactConfig.display.labelAlignment = 'none'
+    # 原分类使用固定输出断言；默认启用的 Token 在专属套件覆盖。
+    $compactConfig.tokenStatistics.enabled = $false
     [IO.File]::WriteAllText((Join-Path $ConfigRoot 'config.json'), ($compactConfig | ConvertTo-Json -Depth 50), $Utf8NoBom)
     Copy-Item -LiteralPath $VersionSource -Destination (Join-Path $TestRoot 'VERSION') -Force
     $env:CODEX_TASK_STATS_HOME = $TestRoot
@@ -754,7 +756,7 @@ Move-Item -LiteralPath $old -Destination $new
     foreach ($section in @('【任务信息】', '【执行结果】', '【调用统计】', '【文件变更】', '【Skill采集】', '【统计完整性】')) {
         Assert-Contains -Text $logText -Expected $section
     }
-    Assert-Contains -Text $logText -Expected '程序版本：v3.0'
+    Assert-Contains -Text $logText -Expected '程序版本：v4.0'
     Assert-NotContains -Text $logText -Unexpected '日志格式版本'
     Assert-Contains -Text $logText -Expected '状态：完成'
     Assert-Contains -Text $logText -Expected '状态来源：Hook推定'
@@ -1513,6 +1515,7 @@ function Invoke-V19SubagentCorrelationCompatibilityProbe {
     $null = New-Item -ItemType Directory -Path $legacyConfigRoot -Force
     $legacyConfig = [ordered]@{
         schemaVersion = 6
+        tokenStatistics = [ordered]@{ enabled=$false; showTurn=$false; fields=@() }
         display = [ordered]@{
             multiline = $true
             labelAlignment = 'none'
@@ -1570,7 +1573,7 @@ function Invoke-V19SubagentCorrelationCompatibilityProbe {
         throw '安装程序未复制 VERSION 文件。'
     }
     $installedVersion = [IO.File]::ReadAllText($installedVersionPath, [Text.Encoding]::UTF8).Trim()
-    if (-not [string]::Equals($installedVersion, 'v3.0', [StringComparison]::Ordinal)) {
+    if (-not [string]::Equals($installedVersion, 'v4.0', [StringComparison]::Ordinal)) {
         throw "已安装 VERSION 不正确： $installedVersion"
     }
 
@@ -1613,7 +1616,7 @@ function Invoke-V19SubagentCorrelationCompatibilityProbe {
             Select-Object -First 1
         if ($null -eq $installedLog) { throw '已安装运行时烟雾测试没有生成日志。' }
         $installedLogText = [IO.File]::ReadAllText($installedLog.FullName, [Text.Encoding]::UTF8)
-        Assert-Contains -Text $installedLogText -Expected '程序版本：v3.0'
+        Assert-Contains -Text $installedLogText -Expected '程序版本：v4.0'
     }
     finally {
         $MainScript = $sourceMainScriptForTests
@@ -1623,6 +1626,10 @@ function Invoke-V19SubagentCorrelationCompatibilityProbe {
     $installedConfigPath = Join-Path $fakeCodexHome 'task-stats\config\config.json'
     $installedAfterMerge = [IO.File]::ReadAllText($installedConfigPath, [Text.Encoding]::UTF8) | ConvertFrom-Json
     if ([int]$installedAfterMerge.schemaVersion -ne 11) { throw '安装程序未将 schemaVersion 迁移为 11。' }
+    if ($installedAfterMerge.tokenStatistics.enabled -or $installedAfterMerge.tokenStatistics.showTurn -or
+        @($installedAfterMerge.tokenStatistics.fields).Count -ne 0 -or -not $installedAfterMerge.tokenStatistics.showSession) {
+        throw '升级必须保留 Token false/空数组，并补齐缺失的范围配置。'
+    }
     if (-not [string]::Equals([string]$installedAfterMerge.legacyPreserveValue, 'keep-after-install', [StringComparison]::Ordinal)) { throw '安装程序未保留旧配置值。' }
     if ($null -eq $installedAfterMerge.display.showSuccessStatus) { throw '安装程序未添加 display.showSuccessStatus。' }
     if ($null -eq $installedAfterMerge.display.hideEmptyCategories) { throw '安装程序未添加 display.hideEmptyCategories。' }
@@ -1649,7 +1656,7 @@ function Invoke-V19SubagentCorrelationCompatibilityProbe {
     if (-not [string]::Equals([string]$installedAfterMerge.toolAliases.apply_patch, '文件修改', [StringComparison]::Ordinal)) { throw '安装程序意外删除了应保留的旧别名。' }
     $installConfigBackup = Get-ChildItem -LiteralPath (Join-Path $fakeCodexHome 'task-stats\backups') -Filter 'config.json.backup-*' -File | Select-Object -First 1
     if ($null -eq $installConfigBackup) { throw '安装程序未备份现有 config.json。' }
-    $runtimeBackup = Get-ChildItem -LiteralPath (Join-Path $fakeCodexHome 'task-stats\backups') -Directory -Filter 'runtime.before-v3.0-*' | Select-Object -First 1
+    $runtimeBackup = Get-ChildItem -LiteralPath (Join-Path $fakeCodexHome 'task-stats\backups') -Directory -Filter 'runtime.before-v4.0-*' | Select-Object -First 1
     if ($null -eq $runtimeBackup) { throw '安装程序未创建升级前运行时备份。' }
     if (-not (Test-Path -LiteralPath (Join-Path $runtimeBackup.FullName 'codex-task-stats.ps1') -PathType Leaf)) {
         throw '运行时备份缺少升级前主处理器。'
@@ -1684,6 +1691,10 @@ function Invoke-V19SubagentCorrelationCompatibilityProbe {
     }
     $updatedConfig = [IO.File]::ReadAllText($installedConfigPath, [Text.Encoding]::UTF8) | ConvertFrom-Json
     if ([int]$updatedConfig.schemaVersion -ne 11) { throw '推荐配置脚本未设置 schemaVersion 11。' }
+    if (-not $updatedConfig.tokenStatistics.enabled -or -not $updatedConfig.tokenStatistics.showTurn -or
+        -not $updatedConfig.tokenStatistics.showSession -or @($updatedConfig.tokenStatistics.fields).Count -ne 10) {
+        throw '推荐配置必须恢复 Token 全部字段与两个范围。'
+    }
     if ([bool]$updatedConfig.display.multiline -ne $true) { throw '推荐配置脚本未开启 multiline 输出。' }
     if ($updatedConfig.display.labelAlignment -ne 'center') { throw '推荐配置脚本未启用居中。' }
     if ([bool]$updatedConfig.display.showCoverageNotice -ne $false) { throw '推荐配置脚本未隐藏客户端统计范围说明。' }
@@ -1715,7 +1726,7 @@ function Invoke-V19SubagentCorrelationCompatibilityProbe {
 
     $statusOutput = & powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $StatusScript | Out-String
     Assert-Contains -Text $statusOutput -Expected 'SourceVersion'
-    Assert-Contains -Text $statusOutput -Expected 'v3.0'
+    Assert-Contains -Text $statusOutput -Expected 'v4.0'
     Assert-Matches -Text $statusOutput -Pattern '(?m)^CodexHomeSource\s*:\s*EnvironmentVariable\s*$'
     $statusOutputWithoutWrappedLines = [Regex]::Replace($statusOutput, "\r?\n\s+", '')
     Assert-Contains -Text $statusOutputWithoutWrappedLines -Expected $fakeCodexHome
@@ -1990,6 +2001,8 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 
+    & powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $ProjectRoot 'tests\token-statistics.tests.ps1')
+    if ($LASTEXITCODE -ne 0) { throw 'Token 统计回归失败。' }
     & powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $ProjectRoot 'tests\runtime-recovery.tests.ps1')
     if ($LASTEXITCODE -ne 0) { throw '运行时恢复回归失败。' }
     & powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $ProjectRoot 'tests\display-alignment.tests.ps1')

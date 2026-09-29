@@ -17,7 +17,7 @@ foreach ($definition in $ast.EndBlock.Statements) {
 }
 . (Join-Path $ProjectRoot 'src\lib\SubagentCorrelation.ps1')
 $config = Get-Content -LiteralPath (Join-Path $ProjectRoot 'config\config.example.json') -Raw -Encoding UTF8 | ConvertFrom-Json
-$ProgramVersion = 'v3.0'
+$ProgramVersion = 'v4.0'
 $TestDurationMilliseconds = 0
 $testRoot = Join-Path ([IO.Path]::GetTempPath()) ('codex-net-stats-' + [Guid]::NewGuid().ToString('N'))
 $work = Join-Path $testRoot 'workspace'

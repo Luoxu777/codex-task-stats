@@ -721,7 +721,7 @@ Assert-SubagentCorrelationRuntimeCompatibility -LibraryPath $SourceSubagentCorre
 
 $PackageVersion = [IO.File]::ReadAllText($SourceVersionPath, [Text.Encoding]::UTF8).Trim()
 if ($PackageVersion -notmatch '^v[0-9]+\.[0-9]$') {
-    throw "VERSION 值无效：$PackageVersion。预期格式为 v<主版本>.<更新号>，例如 v3.0。"
+    throw "VERSION 值无效：$PackageVersion。预期格式为 v<主版本>.<更新号>，例如 v4.0。"
 }
 
 try {

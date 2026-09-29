@@ -9,7 +9,9 @@ foreach ($definition in $ast.EndBlock.Statements) {
 }
 . (Join-Path $project 'src\lib\SubagentCorrelation.ps1')
 $config = Get-Content (Join-Path $project 'config\config.example.json') -Raw -Encoding UTF8 | ConvertFrom-Json
-$ProgramVersion = 'v3.0'
+# 保留原分类的精确排版契约；Token 组合排版由 token-statistics.tests.ps1 覆盖。
+$config.tokenStatistics.enabled = $false
+$ProgramVersion = 'v4.0'
 $TestDurationMilliseconds = 1000
 $state = [pscustomobject]@{ startedAt='2026-09-28T10:00:00+08:00'; startSource='UserPromptSubmit'; promptCount=1 }
 $events = @([pscustomobject]@{ event='PostToolUse'; toolName='mcp__test__read'; toolUseId='one' })
@@ -68,6 +70,7 @@ try {
     $env:CODEX_TASK_STATS_HOME = $testRoot
     foreach ($case in @('center','left','right','none','missing','invalid','long-label','single-line','bracket','no-icon','custom-icon')) {
         $config = Get-Content (Join-Path $project 'config\config.example.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+        $config.tokenStatistics.enabled = $false
         switch ($case) {
             'missing' { $config.display.PSObject.Properties.Remove('labelAlignment') }
             'long-label' { $config.display.labels.subagent = '更长的子Agent' }

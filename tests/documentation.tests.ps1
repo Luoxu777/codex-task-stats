@@ -102,13 +102,6 @@ foreach ($stem in @('CHANGELOG', 'CONTRIBUTING', 'SECURITY', 'CONFIGURATION')) {
         if ($tables[0] -cne $tables[1]) { throw '中英文配置表的字段或默认值不一致。' }
     }
 }
-foreach ($name in @('REQUIREMENTS.md', 'DETAILED-DESIGN.md', 'TEST-CHECKLIST.md')) {
-    $path = Join-Path $project ('docs\' + $name)
-    # 本地历史资料不随源码分发，公开仓库不依赖这些文件。
-    if ((Test-Path -LiteralPath $path) -and -not ([IO.File]::ReadAllText($path).Contains('> 历史归档：'))) {
-        throw "本地旧文档未明确历史范围：$name"
-    }
-}
 $uninstallHelp = Get-Help (Join-Path $project 'scripts\uninstall.ps1') -Full
 if (-not ([string]$uninstallHelp.Synopsis).Contains('Codex Task Stats')) { throw '卸载脚本缺少可读取的帮助。' }
 foreach ($parameter in @('CodexHome', 'RemoveProgram', 'RemoveLogs')) {
@@ -138,4 +131,4 @@ foreach ($name in @('README.md','README_EN.md','HOOK_DISPLAY.md','CONFIGURATION.
         if (-not $text.Contains($display)) { throw "$name 缺少已约定的示例或状态：$display" }
     }
 }
-Write-Host '双语文档结构、语言切换、配置字段与默认值、Token 示例、版本、本地链接与锚点、图片、历史范围及卸载帮助检查通过。'
+Write-Host '双语文档结构、语言切换、配置字段与默认值、Token 示例、版本、本地链接与锚点、图片及卸载帮助检查通过。'

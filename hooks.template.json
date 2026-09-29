@@ -8,7 +8,7 @@
             "type": "command",
             "command": "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"__INSTALL_DIR__\\bin\\codex-task-stats.ps1\" -Event \"UserPromptSubmit\"",
             "commandWindows": "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"__INSTALL_DIR__\\bin\\codex-task-stats.ps1\" -Event \"UserPromptSubmit\"",
-            "timeout": 5,
+            "timeout": 10,
             "async": false
           }
         ]

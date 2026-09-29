@@ -1562,6 +1562,33 @@ function Invoke-V19SubagentCorrelationCompatibilityProbe {
     if ((Get-TaskStatsHandlerCount -HooksRoot $mergedHooks) -ne 9) {
         throw '安装程序未注册恰好 9 个 codex-task-stats 处理器。'
     }
+    # 参考模板必须与 Quiet 模式实际安装结果一致，防止超时等默认值漂移。
+    $hookTemplate = [IO.File]::ReadAllText((Join-Path $ProjectRoot 'hooks.template.json')) | ConvertFrom-Json
+    if (@($hookTemplate.hooks.PSObject.Properties).Count -ne (Get-TaskStatsHandlerCount -HooksRoot $mergedHooks)) {
+        throw 'Hook 模板事件数量与安装器不一致。'
+    }
+    foreach ($eventProperty in $hookTemplate.hooks.PSObject.Properties) {
+        $referenceGroups = @($eventProperty.Value)
+        if ($referenceGroups.Count -ne 1 -or @($referenceGroups[0].hooks).Count -ne 1) { throw "模板事件结构无效：$($eventProperty.Name)" }
+        $reference = $referenceGroups[0].hooks[0]
+        $installedGroups = @($mergedHooks.hooks.($eventProperty.Name) | Where-Object {
+            @($_.hooks | Where-Object { $_.command -match 'codex-task-stats\.ps1' }).Count -gt 0
+        })
+        if ($installedGroups.Count -ne 1) { throw "模板事件未正确注册：$($eventProperty.Name)" }
+        $installed = @($installedGroups[0].hooks | Where-Object { $_.command -match 'codex-task-stats\.ps1' })
+        if ($installed.Count -ne 1) { throw "模板事件处理器不唯一：$($eventProperty.Name)" }
+        foreach ($field in @('type', 'command', 'commandWindows', 'timeout', 'async')) {
+            $expectedValue = $reference.$field
+            if ($field -in @('command', 'commandWindows')) {
+                $expectedValue = $expectedValue.Replace('__INSTALL_DIR__', (Join-Path $fakeCodexHome 'task-stats'))
+            }
+            if ($installed[0].$field -cne $expectedValue) { throw "Hook 模板与安装结果不一致：$($eventProperty.Name).$field" }
+        }
+        $referenceMatcher = $referenceGroups[0].PSObject.Properties['matcher']
+        $installedMatcher = $installedGroups[0].PSObject.Properties['matcher']
+        if (($null -eq $referenceMatcher) -ne ($null -eq $installedMatcher)) { throw "Hook matcher 是否存在不一致：$($eventProperty.Name)" }
+        if ($null -ne $referenceMatcher -and $referenceMatcher.Value -cne $installedMatcher.Value) { throw "Hook matcher 不一致：$($eventProperty.Name)" }
+    }
     Assert-Contains -Text ($mergedHooks | ConvertTo-Json -Depth 50) -Expected 'powershell.exe -NoProfile -Command'
     $backup = Get-ChildItem -LiteralPath (Join-Path $fakeCodexHome 'task-stats\backups') -Filter 'hooks.json.backup-*' -File | Select-Object -First 1
     if ($null -eq $backup) {

@@ -1,4 +1,28 @@
-﻿[CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High')]
+﻿<#
+.SYNOPSIS
+移除 Codex Task Stats Hook，并按选项清理本项目的数据。
+.DESCRIPTION
+默认只移除本项目 Hook。实际修改 hooks.json 前在 task-stats/backups 中备份。
+RemoveProgram 保留每日日志和备份；同时指定 RemoveLogs 删除整个安装目录，包含卸载备份。
+清理前请将需要保留的备份复制到安装目录之外。卸载后完全重启客户端。
+.PARAMETER CodexHome
+安装时使用的 Codex Home。未指定时依次使用 CODEX_HOME 环境变量和当前用户目录下的 .codex。
+.PARAMETER RemoveProgram
+删除程序、配置、统计状态、调试日志和版本文件，保留每日日志及备份。
+.PARAMETER RemoveLogs
+仅与 RemoveProgram 同时指定时生效，删除整个 task-stats 目录，包括日志及备份。
+单独指定本参数不清理数据。
+.EXAMPLE
+.\scripts\uninstall.ps1 -CodexHome 'E:\.codex' -WhatIf
+预览移除本项目 Hook，不修改文件。
+.EXAMPLE
+.\scripts\uninstall.ps1 -CodexHome 'E:\.codex' -RemoveProgram
+移除本项目 Hook 和程序数据，保留每日日志及备份；执行前请求确认。
+.EXAMPLE
+.\scripts\uninstall.ps1 -CodexHome 'E:\.codex' -RemoveProgram -RemoveLogs -WhatIf
+预览完整清理。确认范围并另行保存所需备份后，去掉 WhatIf 执行。
+#>
+[CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High')]
 param(
     [AllowNull()]
     [AllowEmptyString()]
